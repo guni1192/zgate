@@ -173,6 +173,10 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 		log.Printf("Client disconnected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
 	}()
 
+	// Send Virtual IP configuration to agent via HTTP headers
+	w.Header().Set("Zgate-Virtual-IP", virtualIP.String())
+	w.Header().Set("Zgate-Gateway-IP", ServerIP)
+	w.Header().Set("Zgate-Subnet-Mask", "255.255.255.0")
 	w.WriteHeader(http.StatusOK)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
