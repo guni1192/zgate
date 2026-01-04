@@ -1,0 +1,37 @@
+version: "1.0"
+metadata:
+  name: "zgate-policy"
+  description: "IP-based ACL for ZTNA"
+  created_at: "2026-01-04T00:00:00Z"
+
+default_action: deny
+
+clients:
+  client-1:
+    description: "Medical Institution A - Restricted Access"
+    rules:
+      - id: "allow-dns"
+        type: ip_cidr
+        action: allow
+        destinations:
+          - 8.8.8.8/32
+          - 1.1.1.1/32
+        metadata:
+          reason: "DNS resolution"
+          category: "infrastructure"
+
+      - id: "deny-default"
+        type: default
+        action: deny
+
+  client-2:
+    description: "Medical Institution B - Full Internet Access"
+    rules:
+      - id: "allow-all"
+        type: ip_cidr
+        action: allow
+        destinations:
+          - 0.0.0.0/0
+        metadata:
+          reason: "Full internet access"
+          category: "unrestricted"

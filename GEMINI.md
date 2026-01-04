@@ -78,7 +78,16 @@ zgate/
 │   ├── net_linux.go
 │   └── net_darwin.go
 │
-├── internal/                       # Private packages
+├── relay/                          # Relay server packages
+│   ├── main.go                     # Relay entry point
+│   ├── acl/                        # Access Control List
+│   ├── audit/                      # Structured audit logging
+│   ├── policy/                     # Policy storage abstraction
+│   ├── ipam/                       # IP Address Management
+│   ├── session/                    # Session management
+│   └── internal/                   # Platform-specific helpers
+│
+├── internal/                       # Private packages (deprecated)
 │   └── relay/
 │       ├── net_linux.go
 │       └── net_darwin.go
@@ -97,9 +106,11 @@ zgate/
 │       └── agent-entrypoint.sh
 │
 ├── scripts/
-│   └── generate-certs.sh           # Certificate generation
+│   ├── generate-certs.sh           # Certificate generation
+│   └── test-acl.sh                 # ACL E2E test script
 │
 ├── certs/                          # Generated certificates (gitignored)
+├── policy.yaml                     # ACL policy configuration
 │
 ├── docs/
 │   ├── architecture/
@@ -163,15 +174,28 @@ zgate/
   * Client certificate-based authentication
   * Client ID extraction from CN field
   * TLS 1.3 enforcement
-* [ ] **Phase 3.2: ACL (Access Control List)** - Planned
-  * Destination IP-based access control
-  * Static YAML policy file
-  * Structured audit logging
-  * See: `docs/architecture/phase-3.2-acl-plan.md`
+* [x] **Phase 3.2: ACL (Access Control List)** - Completed
+  * **Phase 3.2.1: ACL Foundation** ✅
+    * YAML-based policy engine with IP CIDR matching
+    * Structured audit logging (JSON format to stdout)
+    * Client-specific rule enforcement (first-match-wins)
+    * Default deny policy with explicit allow rules
+  * **Phase 3.2.2: IPAM (IP Address Management)** ✅
+    * Dynamic Virtual IP allocation (10.100.0.2-254)
+    * ClientID-based deterministic allocation (same client = same IP)
+    * Dual-index session manager (routing + admin lookups)
+    * HTTP 503 on IP pool exhaustion
+    * 94.4% test coverage (IPAM), 80.3% (session manager)
+  * **Phase 3.2.3: Integration** - TODO
+    * Agent dynamic IP configuration from Relay
+    * ACL enforcement in packet path (handleMasqueRequest)
+    * VirtualIP → ClientID lookup for ACL checks
+    * E2E validation with multi-client ACL enforcement
 * [ ] **Phase 3.3+: Connector & Advanced Features**
   * On-prem Connector (reverse tunnel)
   * FQDN-based ACL
   * Policy management API
+  * IPAM persistence (optional)
 
 ## 7. How to Run (Development)
 
@@ -184,13 +208,23 @@ cd deployments/docker
 docker compose up --build
 
 # 3. Verify connectivity (from separate terminal)
-docker compose exec agent ping -c 4 8.8.8.8
+docker compose exec agent-1 ping -c 4 8.8.8.8
+docker compose exec agent-2 ping -c 4 8.8.8.8
+
+# 4. Check IPAM allocation logs
+docker compose logs relay | grep "Virtual IP"
 ```
 
 ### E2E Tests
 
 ```bash
 make e2e
+```
+
+### Test ACL Enforcement
+
+```bash
+bash scripts/test-acl.sh
 ```
 
 ### Build Binaries
@@ -209,20 +243,44 @@ make clean
 
 ## 8. Next Steps
 
-1. **Phase 3.2**: Implement ACL (Access Control List) based on Destination IP
-   - See detailed plan: `docs/architecture/phase-3.2-acl-plan.md`
-   - Create `internal/relay/acl/` package
-   - Create `pkg/audit/` shared logging package
-   - Policy configuration via YAML file
+### Phase 3.2.3: ACL-IPAM Integration (Immediate)
 
-2. **Phase 3.3**: On-prem Connector
-   - Reverse tunnel for internal resources
-   - Extend ACL for connector routing
+**Goal**: Complete Phase 3.2 by integrating ACL enforcement with IPAM
 
-3. **Phase 4**: Policy Management API
-   - REST API for dynamic policy updates
-   - Database backend for policy storage
-   - Web UI for administration
+**Tasks**:
+1. **Agent Dynamic IP Configuration**
+   - Modify Relay to send Virtual IP via HTTP header (`X-Virtual-IP`)
+   - Update Agent to read and configure TUN interface dynamically
+   - Remove hardcoded `ClientIP = "10.100.0.2"` from agent/main.go
+
+2. **ACL Enforcement in Packet Path**
+   - Add ACL check in `handleMasqueRequest` upstream handler
+   - Extract packet info (src/dst IP, protocol, ports)
+   - Call `aclEngine.CheckAccess(clientID, packetInfo)`
+   - Drop packets on deny, log via audit logger
+
+3. **VirtualIP → ClientID Lookup**
+   - Use `sessionManager.GetByVirtualIP()` to resolve ClientID
+   - Enable ACL enforcement based on source Virtual IP
+
+4. **E2E Validation**
+   - Verify client-1 can only reach 8.8.8.8/32 and 1.1.1.1/32
+   - Verify client-2 can reach any destination (0.0.0.0/0)
+   - Confirm audit logs show ACL decisions
+
+**Estimated Effort**: 1-2 days
+
+---
+
+### Phase 3.3: On-prem Connector (Future)
+- Reverse tunnel for internal resources
+- Extend ACL for connector routing
+- IPAM persistence for production deployments
+
+### Phase 4: Policy Management API (Future)
+- REST API for dynamic policy updates
+- Database backend for policy storage
+- Web UI for administration
 
 ## 9. Development Workflow
 

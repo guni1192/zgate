@@ -12,19 +12,21 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./certs:/certs:ro
+      - ./policy.yaml:/etc/zgate/policy.yaml:ro
     environment:
       - USE_MTLS=${USE_MTLS:-true}
+      - ACL_POLICY_PATH=/etc/zgate/policy.yaml
     ports:
       - "4433:4433/udp"
     networks:
       zgate-net:
         ipv4_address: 172.28.0.10
 
-  agent:
+  agent-1:
     build:
       context: .
       dockerfile: agent/Dockerfile
-    container_name: zgate-agent
+    container_name: zgate-agent-1
     depends_on:
       - relay
     cap_add:
@@ -37,10 +39,32 @@ services:
       - RELAY_URL=https://172.28.0.10:4433/
       - CLIENT_ID=client-1
       - USE_MTLS=${USE_MTLS:-true}
-      - TARGET_CIDRS=8.8.8.8/32
+      - TARGET_CIDRS=8.8.8.8/32,1.1.1.1/32
     networks:
       zgate-net:
         ipv4_address: 172.28.0.20
+
+  agent-2:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: zgate-agent-2
+    depends_on:
+      - relay
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      - RELAY_URL=https://172.28.0.10:4433/
+      - CLIENT_ID=client-2
+      - USE_MTLS=${USE_MTLS:-true}
+      - TARGET_CIDRS=0.0.0.0/0
+    networks:
+      zgate-net:
+        ipv4_address: 172.28.0.21
 
 networks:
   zgate-net:
