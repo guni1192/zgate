@@ -174,7 +174,7 @@ zgate/
   * Client certificate-based authentication
   * Client ID extraction from CN field
   * TLS 1.3 enforcement
-* [x] **Phase 3.2: ACL (Access Control List)** - Completed
+* [x] **Phase 3.2: ACL (Access Control List)** - ✅ Completed
   * **Phase 3.2.1: ACL Foundation** ✅
     * YAML-based policy engine with IP CIDR matching
     * Structured audit logging (JSON format to stdout)
@@ -186,11 +186,11 @@ zgate/
     * Dual-index session manager (routing + admin lookups)
     * HTTP 503 on IP pool exhaustion
     * 94.4% test coverage (IPAM), 80.3% (session manager)
-  * **Phase 3.2.3: Integration** - TODO
-    * Agent dynamic IP configuration from Relay
-    * ACL enforcement in packet path (handleMasqueRequest)
-    * VirtualIP → ClientID lookup for ACL checks
-    * E2E validation with multi-client ACL enforcement
+  * **Phase 3.2.3: ACL-IPAM Integration** ✅
+    * Virtual IP dynamic allocation via HTTP headers
+    * Agent auto-configuration from Relay
+    * ACL enforcement in upstream packet path
+    * Multi-client E2E validation passed
 * [ ] **Phase 3.3+: Connector & Advanced Features**
   * On-prem Connector (reverse tunnel)
   * FQDN-based ACL
@@ -241,36 +241,141 @@ make agent    # Builds zgate-agent
 make clean
 ```
 
-## 8. Next Steps
+## 8. Protocol Specifications
 
-### Phase 3.2.3: ACL-IPAM Integration (Immediate)
+### 8.1 Virtual IP Assignment (Phase 3.2.3)
 
-**Goal**: Complete Phase 3.2 by integrating ACL enforcement with IPAM
+**HTTP Headers for Configuration Exchange:**
 
-**Tasks**:
-1. **Agent Dynamic IP Configuration**
-   - Modify Relay to send Virtual IP via HTTP header (`X-Virtual-IP`)
-   - Update Agent to read and configure TUN interface dynamically
-   - Remove hardcoded `ClientIP = "10.100.0.2"` from agent/main.go
+When a client establishes a CONNECT tunnel, the Relay sends Virtual IP configuration via custom HTTP response headers:
 
-2. **ACL Enforcement in Packet Path**
-   - Add ACL check in `handleMasqueRequest` upstream handler
-   - Extract packet info (src/dst IP, protocol, ports)
-   - Call `aclEngine.CheckAccess(clientID, packetInfo)`
-   - Drop packets on deny, log via audit logger
+| Header Name | Description | Example Value | Required |
+|------------|-------------|---------------|----------|
+| `Zgate-Virtual-IP` | Allocated Virtual IP for the client | `10.100.0.2` | Yes |
+| `Zgate-Gateway-IP` | Relay gateway IP address | `10.100.0.1` | Yes |
+| `Zgate-Subnet-Mask` | Virtual network subnet mask | `255.255.255.0` | Yes |
 
-3. **VirtualIP → ClientID Lookup**
-   - Use `sessionManager.GetByVirtualIP()` to resolve ClientID
-   - Enable ACL enforcement based on source Virtual IP
+**Flow:**
+1. Agent sends HTTP CONNECT request to Relay
+2. Relay allocates Virtual IP via IPAM
+3. Relay responds with HTTP 200 OK + headers
+4. Agent reads headers and configures TUN interface dynamically
+5. Tunnel established with assigned Virtual IP
 
-4. **E2E Validation**
-   - Verify client-1 can only reach 8.8.8.8/32 and 1.1.1.1/32
-   - Verify client-2 can reach any destination (0.0.0.0/0)
-   - Confirm audit logs show ACL decisions
-
-**Estimated Effort**: 1-2 days
+**Error Handling:**
+- Missing headers → Agent returns error and retries
+- IP pool exhaustion → Relay returns HTTP 503 Service Unavailable
 
 ---
+
+### 8.2 Session Manager Architecture
+
+**Purpose:** Dual-index session lookup for efficient routing and administration
+
+**Data Structures:**
+
+```go
+type Manager struct {
+    byVirtualIP sync.Map  // string (IP) → *ClientSession (for packet routing)
+    byClientID  sync.Map  // string (ClientID) → *ClientSession (for ACL/admin)
+    allocator   ipam.Allocator
+    mu          sync.Mutex
+}
+```
+
+**Key Operations:**
+
+| Method | Use Case | Lookup Key | Performance |
+|--------|----------|------------|-------------|
+| `Create(sess)` | New client connection | N/A | O(1) |
+| `Delete(sess)` | Client disconnect | N/A | O(1) |
+| `GetByVirtualIP(ip)` | Packet routing (dst IP → session) | Virtual IP | O(1) |
+| `GetByClientID(id)` | ACL checks, admin queries | Client ID (CN) | O(1) |
+
+**Lifecycle:**
+1. Client connects → `Create()` allocates Virtual IP, stores in both indexes
+2. Packet arrives from internet → `GetByVirtualIP()` finds destination session
+3. Packet arrives from client → `GetByClientID()` retrieves ClientID for ACL check
+4. Client disconnects → `Delete()` releases IP, removes from both indexes
+
+**Thread Safety:**
+- Uses `sync.Map` for concurrent read/write access
+- Global mutex protects IPAM allocation/release operations
+- Supports 253 concurrent clients (10.100.0.2-254)
+
+---
+
+### 8.3 ACL Enforcement Flow
+
+**Packet Path with ACL:**
+
+```
+Client → TUN → Agent → HTTP/3 CONNECT Body → Relay
+                                               ↓
+                                    Extract PacketInfo (IP/port)
+                                               ↓
+                                    Lookup ClientID (from mTLS cert)
+                                               ↓
+                                    aclEngine.CheckAccess(clientID, packetInfo)
+                                               ↓
+                                    ┌──────────┴──────────┐
+                                  ALLOW                 DENY
+                                    ↓                     ↓
+                              Write to TUN          Drop packet
+                              Audit log (INFO)      Audit log (WARN)
+                                    ↓
+                              NAT → Internet
+```
+
+**PacketInfo Extraction:**
+- Uses `gopacket` to parse IP headers
+- Extracts: SrcIP, DstIP, Protocol, SrcPort, DstPort (TCP/UDP only)
+- Invalid packets (malformed, non-IPv4) are silently dropped
+
+**ACL Decision:**
+- First-match-wins rule evaluation
+- Logs every decision (ALLOW/DENY) to audit logger
+- DENY → packet dropped at Relay, client receives no response (silent drop)
+
+---
+
+### 8.4 Agent Routing Configuration
+
+**Split-Tunnel Architecture:**
+
+To route all traffic through TUN while maintaining Relay connectivity, the Agent uses a split default route approach:
+
+```bash
+# Virtual network routes (covers entire IPv4 space)
+0.0.0.0/1 via 10.100.0.1 dev tun0        # 0.0.0.0 - 127.255.255.255
+128.0.0.0/1 via 10.100.0.1 dev tun0      # 128.0.0.0 - 255.255.255.255
+
+# Physical network route (for Relay connection)
+default via 172.28.0.1 dev eth0          # Docker network gateway
+```
+
+**Why Split Route?**
+- Cannot use `0.0.0.0/0` directly (conflicts with default route)
+- Relay connection must go through physical interface (eth0)
+- Splitting into two `/1` routes achieves full coverage without conflict
+- More specific routes (TUN /1) take precedence over default route
+
+**Configuration:**
+- `TargetCIDR` constant: `"0.0.0.0/1,128.0.0.0/1"`
+- Agent parses comma-separated CIDRs and adds each route
+- Routes configured after receiving Virtual IP from Relay
+
+**Verification:**
+```bash
+# Check agent routing table
+docker compose exec agent-1 ip route
+
+# Should show both /1 routes pointing to tun0
+```
+
+---
+
+## 9. Next Steps
 
 ### Phase 3.3: On-prem Connector (Future)
 - Reverse tunnel for internal resources
@@ -282,7 +387,7 @@ make clean
 - Database backend for policy storage
 - Web UI for administration
 
-## 9. Development Workflow
+## 10. Development Workflow
 
 ### Working with go.work
 
@@ -326,7 +431,7 @@ make logs-agent
 make dev-down
 ```
 
-## 10. References
+## 11. References
 
 - **MASQUE Protocol**: [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)
 - **QUIC Go**: [github.com/quic-go/quic-go](https://github.com/quic-go/quic-go)

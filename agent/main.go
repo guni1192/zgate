@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
@@ -20,10 +21,8 @@ import (
 
 // 設定定数
 const (
-	ClientIP   = "10.100.0.2"
-	GatewayIP  = "10.100.0.1"
 	MTU        = 1300
-	TargetCIDR = "8.8.8.8/32"
+	TargetCIDR = "0.0.0.0/1,128.0.0.0/1" // Route all traffic through TUN (split into two halves to avoid default route conflict)
 )
 
 // 環境変数から取得、なければデフォルト (macOSローカル用)
@@ -39,18 +38,8 @@ func main() {
 	}
 	defer iface.Close()
 
-	// 2. OSごとのネットワーク設定 (net_*.go で定義)
-	if err := configureInterface(iface.Name(), ClientIP, GatewayIP, MTU); err != nil {
-		log.Fatalf("IF設定失敗: %v", err)
-	}
-	if err := addRoute(TargetCIDR, GatewayIP, iface.Name()); err != nil {
-		log.Fatalf("ルート追加失敗: %v", err)
-	}
-
-	// 終了時のクリーンアップ
-	setupCleanup(TargetCIDR, GatewayIP, iface.Name())
-
-	log.Printf("TUN %s is UP. Target: %s via %s", iface.Name(), TargetCIDR, RelayURL)
+	log.Printf("TUN %s created. Target: %s via %s", iface.Name(), TargetCIDR, RelayURL)
+	log.Println("Waiting for Virtual IP assignment from Relay...")
 
 	// 3. TLS Configuration
 	var tlsConfig *tls.Config
@@ -142,6 +131,35 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status: %s", resp.Status)
 	}
+
+	// Read Virtual IP configuration from response headers
+	assignedIP := resp.Header.Get("Zgate-Virtual-IP")
+	gatewayIP := resp.Header.Get("Zgate-Gateway-IP")
+
+	if assignedIP == "" || gatewayIP == "" {
+		return fmt.Errorf("relay did not provide Virtual IP assignment (got IP=%s, Gateway=%s)", assignedIP, gatewayIP)
+	}
+
+	// Configure TUN interface with assigned Virtual IP
+	log.Printf("Assigned Virtual IP: %s, Gateway: %s", assignedIP, gatewayIP)
+	if err := configureInterface(iface.Name(), assignedIP, gatewayIP, MTU); err != nil {
+		return fmt.Errorf("failed to configure interface: %w", err)
+	}
+
+	// Add routes for target CIDRs via gateway
+	cidrs := strings.Split(TargetCIDR, ",")
+	for _, cidr := range cidrs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if err := addRoute(cidr, gatewayIP, iface.Name()); err != nil {
+			return fmt.Errorf("failed to add route for %s: %w", cidr, err)
+		}
+		log.Printf("Added route: %s via %s dev %s", cidr, gatewayIP, iface.Name())
+	}
+
+	log.Printf("TUN %s configured with Virtual IP %s", iface.Name(), assignedIP)
 
 	log.Println("--- Tunnel Established! ---")
 
