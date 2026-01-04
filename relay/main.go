@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -24,6 +23,7 @@ import (
 	"github.com/guni1192/zgate/relay/acl"
 	"github.com/guni1192/zgate/relay/audit"
 	"github.com/guni1192/zgate/relay/internal"
+	"github.com/guni1192/zgate/relay/ipam"
 	"github.com/guni1192/zgate/relay/policy"
 	"github.com/guni1192/zgate/relay/session"
 	"github.com/quic-go/quic-go/http3"
@@ -31,15 +31,16 @@ import (
 )
 
 const (
-	BindAddr  = "0.0.0.0:4433"
-	ServerIP  = "10.100.0.1"
-	ServerMTU = 1300
+	BindAddr       = "0.0.0.0:4433"
+	VirtualIPRange = "10.100.0.0/24"
+	ServerIP       = "10.100.0.1"
+	ServerMTU      = 1300
 )
 
 var (
-	sessionMap  sync.Map
-	aclEngine   *acl.Engine
-	auditLogger *audit.Logger
+	sessionManager *session.Manager
+	aclEngine      *acl.Engine
+	auditLogger    *audit.Logger
 )
 
 func main() {
@@ -78,6 +79,24 @@ func main() {
 		log.Fatalf("Failed to load ACL policy: %v", err)
 	}
 	defer aclEngine.Close()
+
+	// Initialize IPAM
+	_, ipamNet, _ := net.ParseCIDR(VirtualIPRange)
+	ipamConfig := ipam.Config{
+		Network: ipamNet,
+		RelayIP: net.ParseIP(ServerIP),
+	}
+	ipamAllocator, err := ipam.NewAllocator(ipamConfig)
+	if err != nil {
+		log.Fatalf("Failed to create IPAM allocator: %v", err)
+	}
+	defer ipamAllocator.Close()
+
+	// Initialize Session Manager
+	sessionManager = session.NewManager(ipamAllocator)
+	defer sessionManager.Close()
+
+	log.Printf("IPAM initialized: %+v", ipamAllocator.GetStats())
 
 	// TLS configuration
 	var tlsConfig *tls.Config
@@ -121,11 +140,7 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 
 	// クライアントID抽出（mTLS証明書のCNから）
 	clientID := extractClientID(r)
-	clientVirtualIP := "10.100.0.2"
 	sourceIP := r.RemoteAddr
-
-	auditLogger.LogConnection(clientID, sourceIP, true)
-	log.Printf("Client connected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, clientVirtualIP)
 
 	// ダウンストリーム用のパイプを作成
 	pr, pw := io.Pipe()
@@ -133,18 +148,29 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 	// セッション作成
 	sess := &session.ClientSession{
 		ClientID:    clientID,
-		VirtualIP:   clientVirtualIP,
+		VirtualIP:   "", // Will be set by session manager
 		SourceIP:    sourceIP,
 		Downstream:  pw,
 		ConnectedAt: time.Now(),
 	}
 
-	sessionMap.Store(clientVirtualIP, sess)
+	// Allocate Virtual IP and register session
+	virtualIP, err := sessionManager.Create(sess)
+	if err != nil {
+		log.Printf("IP allocation failed for %s: %v", clientID, err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Server capacity reached"))
+		return
+	}
+
+	auditLogger.LogConnection(clientID, sourceIP, true)
+	log.Printf("Client connected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
+
 	defer func() {
-		sessionMap.Delete(clientVirtualIP)
+		sessionManager.Delete(sess)
 		pw.Close()
 		auditLogger.LogConnection(clientID, sourceIP, false)
-		log.Printf("Client disconnected: %s (CN: %s)", clientVirtualIP, clientID)
+		log.Printf("Client disconnected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
 	}()
 
 	w.WriteHeader(http.StatusOK)
@@ -270,9 +296,8 @@ func handleTunRead(tun *water.Interface) {
 			continue
 		}
 
-		// セッション検索
-		if val, ok := sessionMap.Load(dstIP.String()); ok {
-			sess := val.(*session.ClientSession)
+		// セッション検索 (by Virtual IP for packet routing)
+		if sess, ok := sessionManager.GetByVirtualIP(dstIP.String()); ok {
 			// パイプへ書き込み
 			// 注意: ここで binary.Write せず、生データを渡す。
 			// Length Prefix は Response Body に書く段階で付与する。
