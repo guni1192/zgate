@@ -6,11 +6,9 @@ A Hub-Spoke ZTNA (Zero Trust Network Access) implementation using **MASQUE** (Mu
 
 zgate implements a secure IP proxy using HTTP/3 CONNECT with stream-based packet encapsulation, providing:
 
-- ✅ **100% reliable packet delivery** via QUIC streams
 - ✅ **mTLS authentication** with client certificates
 - ✅ **Encrypted tunneling** using TLS 1.3
 - ✅ **Hub-Spoke architecture** for centralized access control
-- ✅ **Static binary** with zero CGO dependencies
 
 ## Quick Start
 
