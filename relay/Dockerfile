@@ -6,7 +6,7 @@ WORKDIR /build
 COPY relay/go.mod relay/go.sum ./
 RUN go mod download
 
-# Copy relay source
+# Copy relay source (includes policy, audit, acl, session, internal)
 COPY relay/ ./
 
 # Build relay binary

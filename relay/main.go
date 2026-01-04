@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -20,7 +21,11 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/guni1192/zgate/relay/acl"
+	"github.com/guni1192/zgate/relay/audit"
 	"github.com/guni1192/zgate/relay/internal"
+	"github.com/guni1192/zgate/relay/policy"
+	"github.com/guni1192/zgate/relay/session"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 )
@@ -31,7 +36,11 @@ const (
 	ServerMTU = 1300
 )
 
-var sessionMap sync.Map
+var (
+	sessionMap  sync.Map
+	aclEngine   *acl.Engine
+	auditLogger *audit.Logger
+)
 
 func main() {
 	// OSごとの設定を取得 (internal/net_*.go)
@@ -48,6 +57,27 @@ func main() {
 	log.Printf("Relay TUN %s is UP at %s", iface.Name(), ServerIP)
 
 	go handleTunRead(iface)
+
+	// Initialize audit logger
+	auditLogger = audit.NewLogger(
+		&audit.JSONFormatter{},
+		os.Stdout,
+	)
+	defer auditLogger.Close()
+
+	// Initialize ACL engine
+	policyPath := os.Getenv("ACL_POLICY_PATH")
+	if policyPath == "" {
+		policyPath = "/etc/zgate/policy.yaml"
+	}
+
+	storage := policy.NewYAMLFileStorage(policyPath)
+	aclEngine = acl.NewEngine(storage)
+
+	if err := aclEngine.LoadPolicy(context.Background()); err != nil {
+		log.Fatalf("Failed to load ACL policy: %v", err)
+	}
+	defer aclEngine.Close()
 
 	// TLS configuration
 	var tlsConfig *tls.Config
@@ -91,23 +121,30 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 
 	// クライアントID抽出（mTLS証明書のCNから）
 	clientID := extractClientID(r)
-
-	// 今回は簡易的に Client IP を決め打ち、もしくはヘッダから取る想定
-	// 本来は IPAM (IP Address Management) で動的に割り当てる
 	clientVirtualIP := "10.100.0.2"
+	sourceIP := r.RemoteAddr
 
-	log.Printf("Client connected: %s (CN: %s), Assigning Virtual IP: %s", r.RemoteAddr, clientID, clientVirtualIP)
+	auditLogger.LogConnection(clientID, sourceIP, true)
+	log.Printf("Client connected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, clientVirtualIP)
 
 	// ダウンストリーム用のパイプを作成
-	// TUN Reader (別ゴルーチン) がここに書き込み、HTTP Response Body がここから読む
 	pr, pw := io.Pipe()
 
-	// セッション登録
-	sessionMap.Store(clientVirtualIP, pw)
+	// セッション作成
+	sess := &session.ClientSession{
+		ClientID:    clientID,
+		VirtualIP:   clientVirtualIP,
+		SourceIP:    sourceIP,
+		Downstream:  pw,
+		ConnectedAt: time.Now(),
+	}
+
+	sessionMap.Store(clientVirtualIP, sess)
 	defer func() {
 		sessionMap.Delete(clientVirtualIP)
 		pw.Close()
-		log.Printf("Client disconnected: %s", clientVirtualIP)
+		auditLogger.LogConnection(clientID, sourceIP, false)
+		log.Printf("Client disconnected: %s (CN: %s)", clientVirtualIP, clientID)
 	}()
 
 	w.WriteHeader(http.StatusOK)
@@ -138,8 +175,31 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 				return
 			}
 
-			// TUNへ書き込み (OSがルーティング処理を行う)
-			_, err := tun.Write(packetBuf[:plen])
+			// Extract packet info for ACL check
+			packetInfo := extractPacketInfo(packetBuf[:plen])
+			if packetInfo == nil {
+				continue // Invalid packet
+			}
+
+			// ACL Check
+			result, err := aclEngine.CheckAccess(clientID, packetInfo)
+			if err != nil {
+				log.Printf("[ACL] Error checking access for %s: %v", clientID, err)
+				continue
+			}
+
+			// Log ACL decision
+			auditLogger.LogACL(clientID, packetInfo.DstIP.String(),
+				string(result.Action), result.RuleID, result.Reason)
+
+			if result.Action == policy.ActionDeny {
+				log.Printf("[ACL] DENY %s -> %s (rule: %s)", clientID, packetInfo.DstIP, result.RuleID)
+				continue // Drop packet
+			}
+
+			// Allow: Write to TUN
+			sess.AddBytesReceived(uint64(plen))
+			_, err = tun.Write(packetBuf[:plen])
 			if err != nil {
 				log.Printf("TUN Write Error: %v", err)
 			}
@@ -165,6 +225,9 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 				errChan <- err
 				return
 			}
+
+			// Track bytes sent
+			sess.AddBytesSent(uint64(n))
 
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
@@ -209,17 +272,55 @@ func handleTunRead(tun *water.Interface) {
 
 		// セッション検索
 		if val, ok := sessionMap.Load(dstIP.String()); ok {
+			sess := val.(*session.ClientSession)
 			// パイプへ書き込み
-			pw := val.(*io.PipeWriter)
 			// 注意: ここで binary.Write せず、生データを渡す。
 			// Length Prefix は Response Body に書く段階で付与する。
-			pw.Write(raw)
+			sess.Downstream.Write(raw)
 			log.Printf("[Relay] Routing packet to %s (%d bytes)", dstIP, n)
 		} else {
 			// 宛先が見つからないパケット（例: 自分宛てや不明なクライアント）
 			// log.Printf("No session for IP: %s", dstIP)
 		}
 	}
+}
+
+// extractPacketInfo parses an IP packet and extracts information for ACL matching
+func extractPacketInfo(raw []byte) *acl.PacketInfo {
+	if len(raw) < 20 {
+		return nil // Too short for IPv4 header
+	}
+
+	version := raw[0] >> 4
+	if version != 4 {
+		return nil // Only IPv4 supported for now
+	}
+
+	packet := gopacket.NewPacket(raw, layers.LayerTypeIPv4, gopacket.Default)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return nil
+	}
+
+	ipv4, _ := ipLayer.(*layers.IPv4)
+	info := &acl.PacketInfo{
+		SrcIP:    ipv4.SrcIP,
+		DstIP:    ipv4.DstIP,
+		Protocol: uint8(ipv4.Protocol),
+	}
+
+	// Extract port information if TCP or UDP
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		tcp, _ := tcpLayer.(*layers.TCP)
+		info.SrcPort = uint16(tcp.SrcPort)
+		info.DstPort = uint16(tcp.DstPort)
+	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		udp, _ := udpLayer.(*layers.UDP)
+		info.SrcPort = uint16(udp.SrcPort)
+		info.DstPort = uint16(udp.DstPort)
+	}
+
+	return info
 }
 
 // extractClientID extracts the client identifier from the TLS certificate
