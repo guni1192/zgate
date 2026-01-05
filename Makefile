@@ -54,11 +54,3 @@ dev-up:
 dev-down:
 	@echo "Stopping development environment..."
 	docker compose down
-
-.PHONY: logs-relay
-logs-relay:
-	docker compose logs -f relay
-
-.PHONY: logs-agent
-logs-agent:
-	docker compose logs -f agent

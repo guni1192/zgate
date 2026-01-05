@@ -8,7 +8,7 @@ default_action: deny
 
 clients:
   client-1:
-    description: "Medical Institution A - Restricted Access"
+    description: "Enterprise Client - Restricted Access"
     rules:
       - id: "allow-dns"
         type: ip_cidr
@@ -25,7 +25,7 @@ clients:
         action: deny
 
   client-2:
-    description: "Medical Institution B - Full Internet Access"
+    description: "Individual Client - Full Internet Access"
     rules:
       - id: "allow-all"
         type: ip_cidr
