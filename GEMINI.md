@@ -50,13 +50,20 @@ graph LR
     EthR --"Masquerade"--> Internet((Internet))
 ```
 
-### 3.3 Current Tunneling Mechanism (Phase 2)
+### 3.3 Capsule Protocol (RFC 9297)
 
-* **Method:** HTTP/3 **Stream Tunneling** (Request/Response Body)
-* **Framing:** Simple Length-Prefixed framing to handle packet boundaries in a stream
-  * Format: `[Length (uint16 big-endian)] [IP Packet Payload]`
-* **Method:** `CONNECT`
-* **Header:** `Protocol: connect-ip` (RFC 9484 adherence)
+* **Method:** HTTP/3 **Stream Tunneling** with RFC 9297 Capsule Protocol
+* **Framing:** QUIC Variable-Length Integer (Varint) based capsule framing
+  * Format: `[Type (varint)] [Length (varint)] [Value]`
+  * Type 0x01: ADDRESS_ASSIGN (RFC 9484 - Virtual IP allocation)
+  * Type 0x40: IP_PACKET (IP packet encapsulation)
+* **HTTP Method:** `CONNECT`
+* **HTTP Header:** `Protocol: connect-ip` (RFC 9484 adherence)
+* **Benefits:**
+  * Standards-compliant (RFC 9297, RFC 9484, RFC 9000)
+  * Extensible capsule type system
+  * Efficient QUIC varint encoding
+  * No backward compatibility needed (not in production yet)
 
 ## 4. Directory Structure (Hybrid Monorepo)
 
@@ -92,10 +99,16 @@ zgate/
 │       ├── net_linux.go
 │       └── net_darwin.go
 │
-├── pkg/                            # Shared libraries (future)
-│   ├── protocol/                   # Framing, constants
-│   ├── cert/                       # TLS utilities
-│   └── tunutil/                    # TUN interface helpers
+├── pkg/                            # Shared libraries
+│   └── capsule/                    # RFC 9297 Capsule Protocol implementation
+│       ├── types.go                # Capsule type definitions
+│       ├── varint.go               # RFC 9000 QUIC Varint encoding/decoding
+│       ├── frame.go                # Capsule framing/deframing
+│       ├── reader.go               # Stream reader
+│       ├── writer.go               # Stream writer (thread-safe)
+│       ├── ipconfig.go             # ADDRESS_ASSIGN capsule (RFC 9484)
+│       ├── ippacket.go             # IP_PACKET capsule helpers
+│       └── *_test.go               # Unit tests (86.6% coverage)
 │
 ├── deployments/
 │   └── docker/
@@ -165,11 +178,11 @@ zgate/
 ## 6. Current Status
 
 * [x] **Phase 1: Local TUN/TAP** - Can read/write IP packets from OS
-* [x] **Phase 2: Stream-based Tunneling**
+* [x] **Phase 2: Stream-based Tunneling** (Replaced by Capsule Protocol)
+  * ~~Length-prefixed framing~~ → Migrated to RFC 9297 Capsule Protocol
   * End-to-End Ping (`agent` -> `relay` -> `8.8.8.8`) works with 100% reliability
   * Routing loop resolved via Docker network isolation
   * NAT (IP Masquerade) configured on Relay
-  * Length-prefixed framing ensures reliable packet boundaries over HTTP/3 streams
 * [x] **Phase 3.1: mTLS Authentication**
   * Client certificate-based authentication
   * Client ID extraction from CN field
@@ -187,11 +200,20 @@ zgate/
     * HTTP 503 on IP pool exhaustion
     * 94.4% test coverage (IPAM), 80.3% (session manager)
   * **Phase 3.2.3: ACL-IPAM Integration** ✅
-    * Virtual IP dynamic allocation via HTTP headers
+    * ~~Virtual IP dynamic allocation via HTTP headers~~ → Migrated to ADDRESS_ASSIGN capsule
     * Agent auto-configuration from Relay
     * ACL enforcement in upstream packet path
     * Multi-client E2E validation passed
-* [ ] **Phase 3.3+: Connector & Advanced Features**
+* [x] **Phase 3.3: RFC 9297 Capsule Protocol Migration** - ✅ Completed
+  * RFC 9297 Capsule Protocol implementation (pkg/capsule package)
+  * RFC 9000 QUIC Varint encoding/decoding
+  * RFC 9484 ADDRESS_ASSIGN capsule for Virtual IP allocation
+  * IP_PACKET capsule (Type 0x40) for packet encapsulation
+  * 86.6% test coverage with comprehensive unit tests
+  * Complete migration from Length-Prefix to Capsule Protocol
+  * No backward compatibility required (not in production)
+  * E2E tests passing with 0% packet loss
+* [ ] **Phase 3.4+: Connector & Advanced Features**
   * On-prem Connector (reverse tunnel)
   * FQDN-based ACL
   * Policy management API
@@ -243,28 +265,37 @@ make clean
 
 ## 8. Protocol Specifications
 
-### 8.1 Virtual IP Assignment (Phase 3.2.3)
+### 8.1 Virtual IP Assignment (Phase 3.3 - Capsule Protocol)
 
-**HTTP Headers for Configuration Exchange:**
+**ADDRESS_ASSIGN Capsule (RFC 9484):**
 
-When a client establishes a CONNECT tunnel, the Relay sends Virtual IP configuration via custom HTTP response headers:
+When a client establishes a CONNECT tunnel, the Relay sends Virtual IP configuration via RFC 9484 ADDRESS_ASSIGN capsule:
 
-| Header Name | Description | Example Value | Required |
-|------------|-------------|---------------|----------|
-| `Zgate-Virtual-IP` | Allocated Virtual IP for the client | `10.100.0.2` | Yes |
-| `Zgate-Gateway-IP` | Relay gateway IP address | `10.100.0.1` | Yes |
-| `Zgate-Subnet-Mask` | Virtual network subnet mask | `255.255.255.0` | Yes |
+**Capsule Format:**
+```
+Type:   0x01 (ADDRESS_ASSIGN)
+Length: Variable
+Value:  [Assignment Count (varint)]
+        For each assignment:
+          - Request ID (varint)
+          - IP Version (1 byte): 4 or 6
+          - IP Address (4 or 16 bytes)
+          - Prefix Length (1 byte)
+```
 
 **Flow:**
 1. Agent sends HTTP CONNECT request to Relay
 2. Relay allocates Virtual IP via IPAM
-3. Relay responds with HTTP 200 OK + headers
-4. Agent reads headers and configures TUN interface dynamically
-5. Tunnel established with assigned Virtual IP
+3. Relay responds with HTTP 200 OK
+4. Relay sends ADDRESS_ASSIGN capsule as first capsule
+5. Agent reads and decodes ADDRESS_ASSIGN capsule
+6. Agent configures TUN interface with assigned IP
+7. Subsequent capsules are IP_PACKET (Type 0x40)
 
 **Error Handling:**
-- Missing headers → Agent returns error and retries
+- Invalid capsule type → Agent returns error
 - IP pool exhaustion → Relay returns HTTP 503 Service Unavailable
+- Decode failure → Agent logs error and disconnects
 
 ---
 
@@ -433,7 +464,10 @@ make dev-down
 
 ## 11. References
 
-- **MASQUE Protocol**: [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)
+- **RFC 9297**: [HTTP Datagrams and the Capsule Protocol](https://www.rfc-editor.org/rfc/rfc9297.html)
+- **RFC 9484**: [Proxying IP in HTTP (MASQUE)](https://www.rfc-editor.org/rfc/rfc9484.html)
+- **RFC 9000**: [QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000.html) (Varint encoding)
 - **QUIC Go**: [github.com/quic-go/quic-go](https://github.com/quic-go/quic-go)
 - **TUN/TAP (water)**: [github.com/songgao/water](https://github.com/songgao/water)
 - **Architecture Documentation**: `docs/architecture/`
+- **Implementation Plan**: `docs/plan/hidden-floating-glade.md` (Capsule Protocol Migration)

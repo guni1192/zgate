@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/google/gopacket v1.1.19
+	github.com/guni1192/zgate v0.0.0-00010101000000-000000000000
 	github.com/quic-go/quic-go v0.58.0
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 )
@@ -15,3 +16,5 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
+
+replace github.com/guni1192/zgate => ../
