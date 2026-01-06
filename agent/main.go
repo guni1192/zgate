@@ -20,22 +20,22 @@ import (
 	"github.com/songgao/water"
 )
 
-// 設定定数
+// Configuration constants
 const (
 	MTU        = 1300
 	TargetCIDR = "0.0.0.0/1,128.0.0.0/1" // Route all traffic through TUN (split into two halves to avoid default route conflict)
 )
 
-// 環境変数から取得、なければデフォルト (macOSローカル用)
+// Get from environment variable, or use default (for macOS local)
 var RelayURL = getEnv("RELAY_URL", "https://127.0.0.1:4433/")
 
 func main() {
-	// 1. OSごとの TUN 設定を取得 (net_*.go で定義)
+	// 1. Get OS-specific TUN configuration (defined in net_*.go)
 	config := getWaterConfig()
 
 	iface, err := water.New(config)
 	if err != nil {
-		log.Fatalf("TUN作成失敗: %v", err)
+		log.Fatalf("Failed to create TUN interface: %v", err)
 	}
 	defer iface.Close()
 
@@ -79,7 +79,7 @@ func main() {
 		log.Printf("mTLS enabled with client ID: %s", clientID)
 	}
 
-	// 4. HTTP/3 Transport (共通)
+	// 4. HTTP/3 Transport (shared)
 	tr := &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig: &quic.Config{
@@ -92,15 +92,15 @@ func main() {
 
 	client := &http.Client{Transport: tr, Timeout: 0}
 
-	// 4. トンネルループ
+	// 4. Tunnel loop
 	for {
 		err := startStreamTunnel(client, iface)
-		log.Printf("トンネル切断: %v. 3秒後に再接続...", err)
+		log.Printf("Tunnel disconnected: %v. Reconnecting in 3 seconds...", err)
 		time.Sleep(3 * time.Second)
 	}
 }
 
-// startStreamTunnel (共通ロジック)
+// startStreamTunnel (shared logic)
 func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 	pr, pw := io.Pipe()
 	req, err := http.NewRequest(http.MethodConnect, RelayURL, pr)
@@ -121,7 +121,7 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 			if err != nil {
 				return
 			}
-			// ログ出力 (簡易版)
+			// Log output (simplified)
 			// logPacketDetails(buf[:n])
 
 			// Encapsulate as IP_PACKET capsule
@@ -202,7 +202,7 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 
 		switch cap.Type {
 		case capsule.CapsuleTypeIPPacket:
-			// ログ出力 (ICMP Type確認用)
+			// Log output (for ICMP Type verification)
 			logPacketDetails(cap.Value)
 
 			iface.Write(cap.Value)
@@ -217,17 +217,17 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 	}
 }
 
-// ログ用ヘルパー
+// Helper for logging
 func logPacketDetails(data []byte) {
 	packet := gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
 	if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
 		icmp, _ := icmpLayer.(*layers.ICMPv4)
-		// エラーパケットのみ強調表示
+		// Display only error packets
 		if icmp.TypeCode.Type() != layers.ICMPv4TypeEchoRequest &&
 			icmp.TypeCode.Type() != layers.ICMPv4TypeEchoReply {
 			log.Printf("[ICMP Error] Type:%d Code:%d", icmp.TypeCode.Type(), icmp.TypeCode.Code())
 		} else {
-			// 正常パケットはデバッグレベルで (ここではコメントアウトか適宜表示)
+			// Normal packets at debug level (commented out or displayed as needed)
 			// log.Printf("ICMP Echo Type:%d", icmp.TypeCode.Type())
 		}
 	}

@@ -20,11 +20,15 @@ make certs
 docker compose up --build
 
 # 3. Test connectivity (from another terminal)
-docker compose exec agent ping -c 4 8.8.8.8
+docker compose exec agent-1 ping -c 4 8.8.8.8
 
 # 4. Run E2E tests
 make e2e
 ```
+
+**Note:** To use pre-built images from GHCR instead of building locally, modify `compose.yaml` to use:
+- `image: ghcr.io/guni1192/zgate/relay:latest`
+- `image: ghcr.io/guni1192/zgate/agent:latest`
 
 ## Architecture
 
@@ -61,6 +65,29 @@ zgate/
 ```
 
 ## Build
+
+### Container Images
+
+Pre-built container images are available on GitHub Container Registry:
+
+```bash
+# Pull images
+docker pull ghcr.io/guni1192/zgate/relay:latest
+docker pull ghcr.io/guni1192/zgate/agent:latest
+
+# Available tags:
+# - latest (main branch)
+# - main-<git-sha> (specific commit)
+# - v* (semantic version tags)
+```
+
+**Image Properties:**
+- Multi-platform support (linux/amd64, linux/arm64)
+- Base image: Debian Bookworm Slim
+- OCI-compliant labels and metadata
+- Automated builds via GitHub Actions
+
+### Binary Build
 
 ```bash
 # Build all binaries

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 	"github.com/guni1192/zgate/relay/audit"
 	"github.com/guni1192/zgate/relay/internal"
 	"github.com/guni1192/zgate/relay/ipam"
+	"github.com/guni1192/zgate/relay/logger"
 	"github.com/guni1192/zgate/relay/policy"
 	"github.com/guni1192/zgate/relay/session"
 	"github.com/quic-go/quic-go"
@@ -43,21 +45,39 @@ var (
 	sessionManager *session.Manager
 	aclEngine      *acl.Engine
 	auditLogger    *audit.Logger
+	sysLogger      *slog.Logger
 )
 
 func main() {
-	// OSごとの設定を取得 (internal/net_*.go)
+	// Initialize system logger first
+	sysLogger = logger.New(os.Stdout, slog.LevelInfo)
+
+	// Get OS-specific configuration (internal/net_*.go)
 	config := internal.GetWaterConfig()
 	iface, err := water.New(config)
 	if err != nil {
-		log.Fatalf("TUN作成失敗: %v", err)
+		sysLogger.Error("Failed to create TUN interface",
+			slog.String("component", "System"),
+			slog.String("error", err.Error()),
+		)
+		log.Fatalf("Failed to create TUN interface: %v", err)
 	}
 	defer iface.Close()
 
 	if err := internal.ConfigureInterface(iface.Name(), ServerIP, ServerMTU); err != nil {
-		log.Fatalf("IF設定失敗: %v", err)
+		sysLogger.Error("Failed to configure interface",
+			slog.String("component", "System"),
+			slog.String("interface", iface.Name()),
+			slog.String("error", err.Error()),
+		)
+		log.Fatalf("Failed to configure interface: %v", err)
 	}
-	log.Printf("Relay TUN %s is UP at %s", iface.Name(), ServerIP)
+	sysLogger.Info("TUN interface ready",
+		slog.String("component", "System"),
+		slog.String("interface", iface.Name()),
+		slog.String("ip", ServerIP),
+		slog.Int("mtu", ServerMTU),
+	)
 
 	go handleTunRead(iface)
 
@@ -78,9 +98,19 @@ func main() {
 	aclEngine = acl.NewEngine(storage)
 
 	if err := aclEngine.LoadPolicy(context.Background()); err != nil {
+		sysLogger.Error("Failed to load policy",
+			slog.String("component", "ACL"),
+			slog.String("policy_path", policyPath),
+			slog.String("error", err.Error()),
+		)
 		log.Fatalf("Failed to load ACL policy: %v", err)
 	}
 	defer aclEngine.Close()
+
+	sysLogger.Info("Policy loaded successfully",
+		slog.String("component", "ACL"),
+		slog.String("policy_path", policyPath),
+	)
 
 	// Initialize IPAM
 	_, ipamNet, _ := net.ParseCIDR(VirtualIPRange)
@@ -90,6 +120,11 @@ func main() {
 	}
 	ipamAllocator, err := ipam.NewAllocator(ipamConfig)
 	if err != nil {
+		sysLogger.Error("Failed to create allocator",
+			slog.String("component", "IPAM"),
+			slog.String("network", VirtualIPRange),
+			slog.String("error", err.Error()),
+		)
 		log.Fatalf("Failed to create IPAM allocator: %v", err)
 	}
 	defer ipamAllocator.Close()
@@ -98,22 +133,38 @@ func main() {
 	sessionManager = session.NewManager(ipamAllocator)
 	defer sessionManager.Close()
 
-	log.Printf("IPAM initialized: %+v", ipamAllocator.GetStats())
+	stats := ipamAllocator.GetStats()
+	sysLogger.Info("Allocator initialized",
+		slog.String("component", "IPAM"),
+		slog.String("network", VirtualIPRange),
+		slog.Int("total_ips", stats.TotalIPs),
+		slog.Int("available_ips", stats.AvailableIPs),
+	)
 
 	// TLS configuration
 	var tlsConfig *tls.Config
 	useMTLS := os.Getenv("USE_MTLS")
 	if useMTLS == "false" {
-		log.Println("Using self-signed certificates (Phase 2 compatibility)")
+		sysLogger.Warn("Using self-signed certificates (Phase 2 compatibility)",
+			slog.String("component", "TLS"),
+		)
 		tlsConfig = generateTLSConfig()
 	} else {
-		log.Println("Loading mTLS certificates...")
+		sysLogger.Info("Loading mTLS certificates",
+			slog.String("component", "TLS"),
+		)
 		var err error
 		tlsConfig, err = loadTLSConfig()
 		if err != nil {
+			sysLogger.Error("Failed to load TLS config",
+				slog.String("component", "TLS"),
+				slog.String("error", err.Error()),
+			)
 			log.Fatalf("Failed to load TLS config: %v", err)
 		}
-		log.Println("mTLS enabled - client certificate verification required")
+		sysLogger.Info("mTLS enabled - client certificate verification required",
+			slog.String("component", "TLS"),
+		)
 	}
 
 	// HTTP/3 Server Setup
@@ -127,30 +178,36 @@ func main() {
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
 		QUICConfig: &quic.Config{
-			KeepAlivePeriod: 10 * time.Second,  // Send keep-alive every 10 seconds
-			MaxIdleTimeout:  300 * time.Second,  // 5 minutes idle timeout
+			KeepAlivePeriod:  10 * time.Second,  // Send keep-alive every 10 seconds
+			MaxIdleTimeout:   300 * time.Second,  // 5 minutes idle timeout
+			EnableDatagrams:  true,               // Enable QUIC datagrams
 		},
 	}
 
-	log.Printf("Listening on QUIC %s", BindAddr)
+	sysLogger.Info("Starting HTTP/3 server",
+		slog.String("component", "Server"),
+		slog.String("address", BindAddr),
+		slog.String("keep_alive", "10s"),
+		slog.String("max_idle_timeout", "300s"),
+	)
 	log.Fatal(server.ListenAndServe())
 }
 
-// handleMasqueRequest: クライアント接続ごとの処理
+// handleMasqueRequest: Process per-client connection
 func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Interface) {
 	if r.Method != http.MethodConnect {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// クライアントID抽出（mTLS証明書のCNから）
+	// Extract client ID from mTLS certificate CN
 	clientID := extractClientID(r)
 	sourceIP := r.RemoteAddr
 
-	// ダウンストリーム用のパイプを作成
+	// Create pipe for downstream
 	pr, pw := io.Pipe()
 
-	// セッション作成
+	// Create session
 	sess := &session.ClientSession{
 		ClientID:    clientID,
 		VirtualIP:   "", // Will be set by session manager
@@ -162,20 +219,35 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 	// Allocate Virtual IP and register session
 	virtualIP, err := sessionManager.Create(sess)
 	if err != nil {
-		log.Printf("IP allocation failed for %s: %v", clientID, err)
+		sysLogger.Error("IP allocation failed",
+			slog.String("component", "Session"),
+			slog.String("client_id", clientID),
+			slog.String("source_ip", sourceIP),
+			slog.String("error", err.Error()),
+		)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte("Server capacity reached"))
 		return
 	}
 
 	auditLogger.LogConnection(clientID, sourceIP, true)
-	log.Printf("Client connected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
+	sysLogger.Info("Client connected",
+		slog.String("component", "Session"),
+		slog.String("client_id", clientID),
+		slog.String("source_ip", sourceIP),
+		slog.String("virtual_ip", virtualIP.String()),
+	)
 
 	defer func() {
 		sessionManager.Delete(sess)
 		pw.Close()
 		auditLogger.LogConnection(clientID, sourceIP, false)
-		log.Printf("Client disconnected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
+		sysLogger.Info("Client disconnected",
+			slog.String("component", "Session"),
+			slog.String("client_id", clientID),
+			slog.String("source_ip", sourceIP),
+			slog.String("virtual_ip", virtualIP.String()),
+		)
 	}()
 
 	// Send HTTP 200 OK first
@@ -198,7 +270,11 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 
 	cap, err := assignCapsule.Encode()
 	if err != nil {
-		log.Printf("[IPAM] Failed to encode ADDRESS_ASSIGN for %s: %v", clientID, err)
+		sysLogger.Error("Failed to encode ADDRESS_ASSIGN",
+			slog.String("component", "IPAM"),
+			slog.String("client_id", clientID),
+			slog.String("error", err.Error()),
+		)
 		return
 	}
 
@@ -207,7 +283,11 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 
 	// Send ADDRESS_ASSIGN capsule first
 	if err := capsuleWriter.WriteCapsule(cap); err != nil {
-		log.Printf("[IPAM] Failed to send ADDRESS_ASSIGN to %s: %v", clientID, err)
+		sysLogger.Error("Failed to send ADDRESS_ASSIGN",
+			slog.String("component", "IPAM"),
+			slog.String("client_id", clientID),
+			slog.String("error", err.Error()),
+		)
 		return
 	}
 
@@ -215,14 +295,19 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 		f.Flush()
 	}
 
-	log.Printf("[IPAM] Sent ADDRESS_ASSIGN to %s: %s/32", clientID, virtualIP)
+	sysLogger.Info("Sent ADDRESS_ASSIGN",
+		slog.String("component", "IPAM"),
+		slog.String("client_id", clientID),
+		slog.String("virtual_ip", virtualIP.String()),
+		slog.Int("prefix", 32),
+	)
 
-	// --- 読み書きの並行処理 ---
+	// --- Concurrent read/write processing ---
 
 	// Error channel
 	errChan := make(chan error, 2)
 
-	// A. Upstream: Request Body -> TUN (Clientから来たパケットをOSへ)
+	// A. Upstream: Request Body -> TUN (Packets from Client to OS)
 	// Using RFC 9297 Capsule Protocol
 	go func() {
 		capsuleReader := capsule.NewCapsuleReader(r.Body)
@@ -247,7 +332,12 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 				// ACL Check
 				result, err := aclEngine.CheckAccess(clientID, packetInfo)
 				if err != nil {
-					log.Printf("[ACL] Error checking access for %s: %v", clientID, err)
+					sysLogger.Error("Access check failed",
+						slog.String("component", "ACL"),
+						slog.String("client_id", clientID),
+						slog.String("dst_ip", packetInfo.DstIP.String()),
+						slog.String("error", err.Error()),
+					)
 					continue
 				}
 
@@ -256,7 +346,12 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 					string(result.Action), result.RuleID, result.Reason)
 
 				if result.Action == policy.ActionDeny {
-					log.Printf("[ACL] DENY %s -> %s (rule: %s)", clientID, packetInfo.DstIP, result.RuleID)
+					sysLogger.Warn("Packet denied",
+						slog.String("component", "ACL"),
+						slog.String("client_id", clientID),
+						slog.String("dst_ip", packetInfo.DstIP.String()),
+						slog.String("rule_id", result.RuleID),
+					)
 					continue // Drop packet
 				}
 
@@ -264,28 +359,39 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 				sess.AddBytesReceived(uint64(len(packetBuf)))
 				_, err = tun.Write(packetBuf)
 				if err != nil {
-					log.Printf("TUN Write Error: %v", err)
+					sysLogger.Error("Write error",
+						slog.String("component", "TUN"),
+						slog.String("error", err.Error()),
+					)
 				}
 
 			default:
 				// RFC 9297: Unknown capsule types are silently discarded
-				log.Printf("[Capsule] Unknown type %d from %s (discarding)", cap.Type, clientID)
+				sysLogger.Debug("Unknown capsule type (discarding)",
+					slog.String("component", "Capsule"),
+					slog.String("client_id", clientID),
+					slog.Uint64("type", uint64(cap.Type)),
+				)
 			}
 		}
 	}()
 
-	// B. Downstream: Pipe -> Response Body (OSから来たパケットをClientへ)
-	// handleTunRead が pw に書き込んだデータを、HTTP レスポンスとして送り返す
+	// B. Downstream: Pipe -> Response Body (Packets from OS to Client)
+	// Send back data written to pw by handleTunRead as HTTP response
 	// Using RFC 9297 Capsule Protocol
 	// IMPORTANT: Reuse the same capsuleWriter created above to avoid race conditions
 	go func() {
 		buf := make([]byte, 2000)
 
 		for {
-			// パイプから読む (パケット単位で書き込まれている想定)
+			// Read from pipe (assuming packet-unit writes)
 			n, err := pr.Read(buf)
 			if err != nil {
-				log.Printf("[Downstream] Pipe read error for %s: %v", clientID, err)
+				sysLogger.Debug("Pipe read error",
+					slog.String("component", "Downstream"),
+					slog.String("client_id", clientID),
+					slog.String("error", err.Error()),
+				)
 				errChan <- err
 				return
 			}
@@ -293,7 +399,11 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 			// Encapsulate as IP_PACKET capsule
 			cap := capsule.NewIPPacketCapsule(buf[:n])
 			if err := capsuleWriter.WriteCapsule(cap); err != nil {
-				log.Printf("[Downstream] Capsule write error for %s: %v", clientID, err)
+				sysLogger.Error("Capsule write error",
+					slog.String("component", "Downstream"),
+					slog.String("client_id", clientID),
+					slog.String("error", err.Error()),
+				)
 				errChan <- err
 				return
 			}
@@ -307,24 +417,27 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 		}
 	}()
 
-	// どちらかが終了したら接続終了
+	// Close connection when either goroutine terminates
 	<-errChan
 }
 
-// handleTunRead: TUNから読み出し、宛先IPを見て適切なセッションへ配送
+// handleTunRead: Read from TUN and route to appropriate session based on destination IP
 func handleTunRead(tun *water.Interface) {
 	buf := make([]byte, 2000)
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
-			log.Printf("TUN Read Error: %v", err)
+			sysLogger.Error("Read error",
+				slog.String("component", "TUN"),
+				slog.String("error", err.Error()),
+			)
 			continue
 		}
 		raw := buf[:n]
 
-		// gopacketで宛先IP解析
-		// TUNからはEthernetヘッダなしでIPパケットが来る
-		// (IPv4/IPv6判定は簡易実装)
+		// Parse destination IP with gopacket
+		// IP packets come from TUN without Ethernet header
+		// (Simple IPv4/IPv6 detection)
 		version := raw[0] >> 4
 		var dstIP net.IP
 
@@ -335,23 +448,24 @@ func handleTunRead(tun *water.Interface) {
 				dstIP = ip.DstIP
 			}
 		} else {
-			continue // 今回はIPv4のみ
+			continue // IPv4 only for now
 		}
 
 		if dstIP == nil {
 			continue
 		}
 
-		// セッション検索 (by Virtual IP for packet routing)
+		// Session lookup by Virtual IP for packet routing
 		if sess, ok := sessionManager.GetByVirtualIP(dstIP.String()); ok {
-			// パイプへ書き込み
-			// 注意: ここで binary.Write せず、生データを渡す。
-			// Length Prefix は Response Body に書く段階で付与する。
+			// Write to pipe
+			// Note: Pass raw data without binary.Write here.
+			// Length Prefix is added when writing to Response Body.
 			sess.Downstream.Write(raw)
-			log.Printf("[Relay] Routing packet to %s (%d bytes)", dstIP, n)
-		} else {
-			// 宛先が見つからないパケット（例: 自分宛てや不明なクライアント）
-			// log.Printf("No session for IP: %s", dstIP)
+			sysLogger.Debug("Routing packet",
+				slog.String("component", "Relay"),
+				slog.String("dst_ip", dstIP.String()),
+				slog.Int("bytes", n),
+			)
 		}
 	}
 }

@@ -13,7 +13,7 @@ func GetWaterConfig() water.Config {
 	return water.Config{
 		DeviceType: water.TUN,
 		PlatformSpecificParams: water.PlatformSpecificParams{
-			Name: "tun0", // 固定
+			Name: "tun0", // Fixed
 		},
 	}
 }
