@@ -406,14 +406,374 @@ docker compose exec agent-1 ip route
 
 ---
 
-## 9. Next Steps
+## 9. Kubernetes Production Readiness Roadmap
 
-### Phase 3.3: On-prem Connector (Future)
+### Priority Overview
+
+The development roadmap is now focused on **Kubernetes production readiness** before adding new features (Connector). This ensures the existing functionality can be deployed reliably in production environments.
+
+**Decision Rationale:**
+- Kubernetes infrastructure provides production-grade operations (health monitoring, graceful shutdown, multi-replica HA)
+- Phase 1-2 (Health Checks + Graceful Shutdown) can be completed in **1 day** vs Connector's 3-4 weeks
+- Current implementation lacks production deployment capabilities (no health probes, immediate termination on stop)
+- Connector features can be added after establishing solid Kubernetes foundation
+
+### Implementation Phases
+
+#### 🎯 **Phase 4.1: Kubernetes Foundation (Week 1-2) - IN PROGRESS**
+
+**Status:** Highest priority, starting immediately
+
+##### Phase 4.1.1: Health Check API (Day 1-2) ✅ COMPLETED
+- **Goal:** Minimal HTTP API for Kubernetes liveness/readiness probes
+- **Endpoints:**
+  - `GET /health` - Liveness probe (always 200 if process alive)
+  - `GET /ready` - Readiness probe (200 only after IPAM/ACL initialized)
+- **Implementation:**
+  - ✅ New file: `relay/api/health.go` (75 lines)
+  - ✅ Modified: `relay/main.go` (+35 lines)
+  - ✅ Modified: `compose.yaml` (exposed port 8080)
+  - ✅ Separate HTTP/1.1 server on port 8080 (health) + HTTP/3 on port 4433 (MASQUE)
+- **Benefits:**
+  - Enables Kubernetes health monitoring
+  - Useful for non-K8s deployments (Docker, systemd)
+  - Zero impact on existing functionality
+  - Foundation for future observability features
+- **Test Results:**
+  - ✅ `/health` endpoint: 200 OK with uptime/version
+  - ✅ `/ready` endpoint: 200 OK after IPAM/ACL initialized
+  - ✅ E2E tests: All passing (0% packet loss)
+  - ✅ Unit tests: 94.4% IPAM, 80.3% session, 86.6% capsule coverage
+
+##### Phase 4.1.2: Graceful Shutdown (Day 3-4)
+- **Goal:** SIGTERM signal handling for zero-downtime Pod termination
+- **Implementation:**
+  - Modify: `relay/main.go` (~50 lines)
+  - Signal handling (SIGTERM, SIGINT)
+  - Connection draining (30-second timeout)
+  - Readiness=false on shutdown (stop accepting new connections)
+- **Benefits:**
+  - Prevents data loss on Pod restart/update
+  - Enables rolling updates in Kubernetes
+  - Improves reliability in all deployment scenarios
+  - Integrates with Phase 4.1.1 health checker
+
+**Deliverables:**
+- Production-ready Relay with health monitoring and graceful shutdown
+- Updated Docker Compose configuration for testing
+- Documentation for Kubernetes probe configuration
+
+**Timeline:** Week 1-2 (estimated 1-2 days of development + testing)
+
+---
+
+#### 🟡 **Phase 4.2: zgate-api + PostgreSQL IPAM (Week 3-5) - PLANNED**
+
+**Status:** Medium priority, required for Multi-Relay deployment and future API features
+
+**Architecture Change:** API-first approach for centralized data management
+
+**System Architecture:**
+```
+┌─────────────┐     HTTP API      ┌────────────┐     SQL      ┌────────────┐
+│ zgate-relay │ ─────────────────> │ zgate-api  │ ──────────> │ PostgreSQL │
+│ (Pod 1-N)   │  IPAM operations   │ (REST API) │   Storage    │            │
+└─────────────┘                    └────────────┘              └────────────┘
+                                         │
+                                         ├─ IPAM endpoints
+                                         ├─ Policy management (future)
+                                         └─ Audit log query (future)
+```
+
+**Implementation Decision Matrix:**
+
+| Deployment Scenario | API + PostgreSQL Required? | Implementation Timeline |
+|-------------------|---------------------------|----------------------|
+| Development/Testing | ❌ No (in-memory) | Skip |
+| Production Single Relay | ⚠️ Recommended | Week 3-5 |
+| Production Multi-Relay | ✅ **Required** | Week 3-5 (before K8s deploy) |
+
+**Phase 4.2.1: zgate-api Foundation (Week 3)**
+
+**New Repository/Service:** `zgate-api` (REST API server)
+
+**Implementation:**
+- New service: `cmd/zgate-api/main.go`
+- Database: PostgreSQL schema
+  ```sql
+  CREATE TABLE ipam_allocations (
+      client_id VARCHAR(255) PRIMARY KEY,
+      virtual_ip INET NOT NULL UNIQUE,
+      allocated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      metadata JSONB
+  );
+
+  CREATE INDEX idx_virtual_ip ON ipam_allocations(virtual_ip);
+  CREATE INDEX idx_last_seen ON ipam_allocations(last_seen_at);
+  ```
+
+**REST API Endpoints (IPAM):**
+- `POST /api/v1/ipam/allocations` - Allocate IP for client
+- `GET /api/v1/ipam/allocations/:client_id` - Get allocation
+- `PUT /api/v1/ipam/allocations/:client_id/refresh` - Update last_seen
+- `DELETE /api/v1/ipam/allocations/:client_id` - Release IP
+- `GET /api/v1/ipam/stats` - Get IPAM statistics
+
+**Authentication:**
+- Relay ↔ API: mTLS or API Key (to be decided)
+- Admin ↔ API: JWT authentication (future)
+
+**Phase 4.2.2: Relay API Client Integration (Week 4)**
+
+**Implementation:**
+- New files: `relay/ipam/api_storage.go` (~300 lines)
+- Modify: `relay/ipam/allocator.go` (~50 lines)
+- HTTP client with retry logic and connection pooling
+- Fallback to in-memory if API unavailable (optional)
+
+**Configuration:**
+```yaml
+# relay environment variables
+ZGATE_API_URL: "http://zgate-api:8081"
+ZGATE_API_TIMEOUT: "5s"
+ZGATE_API_RETRY: "3"
+```
+
+**Benefits over Redis:**
+- ✅ Unified data store with future Policy/Audit APIs
+- ✅ Richer query capabilities (SQL)
+- ✅ ACID transactions for complex operations
+- ✅ Simplified infrastructure (no separate Redis cluster)
+- ✅ Extensible for future features (policy versioning, audit log search)
+
+**Benefits over Direct PostgreSQL Access:**
+- ✅ Centralized business logic in API layer
+- ✅ Multiple Relays cannot corrupt data with conflicting SQL
+- ✅ API can enforce rate limits, validation, access control
+- ✅ Easier to add caching layer (Redis) later if needed
+- ✅ Relay remains stateless and database-agnostic
+
+**Trade-offs:**
+- ⚠️ Additional network hop (Relay → API → PostgreSQL)
+- ⚠️ API becomes single point of failure (mitigated by multiple replicas)
+- ⚠️ Slightly higher latency vs direct DB access (~2-5ms overhead)
+
+**Mitigation:**
+- Deploy zgate-api with 2+ replicas for HA
+- Use connection pooling and HTTP keep-alive
+- Implement client-side caching in Relay for GET operations
+
+**Timeline:** Week 3-5 (if Multi-Relay or future API features required)
+
+---
+
+#### 🟢 **Phase 4.3: cert-manager Integration (Week 5-6) - FUTURE**
+
+**Status:** Low priority, deferred until manual certificate management becomes burdensome
+
+**Current State:**
+- Static certificates via `scripts/generate-certs.sh` (365-day validity)
+- Manual renewal once per year is acceptable for initial production deployment
+- No immediate need for automatic rotation
+
+**Implementation (when needed):**
+- cert-manager CA Issuer for private CA
+- Certificate resources for relay-server and clients
+- fsnotify-based TLS config watcher for rotation without downtime
+- New file: `relay/tls/watcher.go` (~200 lines)
+
+**Trigger for Implementation:**
+- Certificate management becomes operational burden
+- Organization already uses cert-manager
+- Multiple environments require certificate automation
+
+**Timeline:** Week 5-6 (when triggered)
+
+---
+
+#### 🟡 **Phase 4.4: Kubernetes Deployment Manifests (Week 6-7) - PLANNED**
+
+**Status:** Medium priority, required after Phase 4.1-4.2 completion
+
+**Prerequisites:**
+- Phase 4.1 (Health Checks + Graceful Shutdown) completed
+- Phase 4.2 (zgate-api + PostgreSQL IPAM) decision finalized
+- Kubernetes cluster available for testing
+
+**Deliverables:**
+
+**zgate-api Service:**
+- `k8s/api/deployment.yaml` - API Deployment (2+ replicas)
+- `k8s/api/service.yaml` - ClusterIP Service (port 8081)
+- `k8s/api/configmap.yaml` - API configuration
+- `k8s/api/secret.yaml` - PostgreSQL connection credentials
+- `k8s/postgres/` - PostgreSQL StatefulSet or external DB connection
+
+**zgate-relay Service:**
+- `k8s/relay/deployment.yaml` - Relay Deployment (3+ replicas)
+- `k8s/relay/service.yaml` - LoadBalancer Service (UDP/4433)
+- `k8s/relay/configmap.yaml` - ACL Policy ConfigMap
+- `k8s/cert-manager/` - Certificate resources (if Phase 4.3 implemented)
+
+**Key Configuration:**
+
+**zgate-api:**
+```yaml
+env:
+- name: DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: postgres-credentials
+      key: url
+- name: SERVER_PORT
+  value: "8081"
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8081
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8081
+```
+
+**zgate-relay:**
+```yaml
+env:
+- name: ZGATE_API_URL
+  value: "http://zgate-api:8081"
+- name: ZGATE_API_TIMEOUT
+  value: "5s"
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+terminationGracePeriodSeconds: 60
+sessionAffinity: ClientIP
+capabilities:
+  add: [NET_ADMIN]
+devices:
+  - /dev/net/tun:/dev/net/tun
+```
+
+**Timeline:** Week 6-7 (after Phase 4.1-4.2)
+
+---
+
+### Deferred Features (Phase 5+)
+
+The following features from the original roadmap are **deferred** until Kubernetes foundation is complete:
+
+#### Phase 5.1: On-prem Connector (Future)
+- Reverse tunnel for internal resources
+- Extend ACL for connector routing
+- New binary: `zgate-connector`
+- Requires: Kubernetes Phase 4.1-4.4 completed first
+
+**Rationale:** Connector is a new feature addition, while Kubernetes readiness improves existing functionality for production deployment.
+
+#### Phase 5.2: Policy Management API (Future)
+- Extend zgate-api with policy management endpoints
+- PostgreSQL backend for policy storage (reuses existing DB)
+- Web UI for administration
+- Full CRUD operations on ACL policies
+- Policy versioning and audit trail
+
+**Implementation (extends Phase 4.2 zgate-api):**
+```sql
+CREATE TABLE policies (
+    id SERIAL PRIMARY KEY,
+    version VARCHAR(50) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    default_action VARCHAR(10) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE policy_rules (
+    id SERIAL PRIMARY KEY,
+    policy_id INTEGER REFERENCES policies(id),
+    client_id VARCHAR(255) NOT NULL,
+    rule_data JSONB NOT NULL,
+    INDEX idx_policy_client (policy_id, client_id)
+);
+```
+
+**REST API Endpoints (Policy):**
+- `GET /api/v1/policies` - List all policies
+- `POST /api/v1/policies` - Create new policy
+- `GET /api/v1/policies/:id` - Get policy detail
+- `PUT /api/v1/policies/:id` - Update policy
+- `DELETE /api/v1/policies/:id` - Delete policy
+- `POST /api/v1/policies/:id/activate` - Activate policy version
+
+**Rationale:** Current YAML-based policy with ConfigMap reload is sufficient for initial production deployment. API-based management becomes valuable when:
+- Multiple administrators need to manage policies
+- Policy changes are frequent
+- Audit trail of policy changes is required
+- Integration with external systems needed
+
+#### Phase 5.3: Advanced Observability (Future)
+- Prometheus `/metrics` endpoint
+- Distributed tracing (OpenTelemetry)
+- Advanced audit log querying
+- Session management API
+
+**Rationale:** Basic health checks (Phase 4.1) and structured logging provide sufficient observability for initial deployment.
+
+---
+
+### Success Criteria
+
+**Phase 4.1 (Kubernetes Foundation) Completion:**
+- ✅ Health check endpoints (`/health`, `/ready`) responding correctly
+- ✅ Graceful shutdown tested (connections drain within 30s)
+- ✅ Docker Compose E2E tests passing
+- ✅ No regression in existing functionality (ACL, IPAM, Capsule Protocol)
+- ✅ Documentation updated (GEMINI.md, README.md)
+
+**Phase 4.2.1 (zgate-api Foundation) Completion:**
+- ✅ PostgreSQL schema deployed and migrations working
+- ✅ REST API endpoints (`/api/v1/ipam/*`) implemented with 90%+ test coverage
+- ✅ API health checks (`/health`, `/ready`) responding correctly
+- ✅ Authentication between Relay ↔ API implemented
+- ✅ Docker Compose integration test (API + PostgreSQL)
+
+**Phase 4.2.2 (Relay API Integration) Completion:**
+- ✅ API client implementation with retry logic and connection pooling
+- ✅ Backward compatibility (in-memory fallback if API unavailable)
+- ✅ Multi-Relay coordination validated (same client gets same IP via API)
+- ✅ IP persistence across Relay Pod restarts
+- ✅ E2E test: Relay → API → PostgreSQL → successful allocation
+
+**Phase 4.4 (Kubernetes Deployment) Completion:**
+- ✅ zgate-api deployment with 2+ replicas
+- ✅ PostgreSQL StatefulSet or external DB connection working
+- ✅ Multi-Relay deployment with 3+ Pods
+- ✅ LoadBalancer distributing traffic correctly
+- ✅ Agent connects through LoadBalancer successfully
+- ✅ Pod restart doesn't break active sessions (API + PostgreSQL persistence)
+- ✅ Rolling update works without connection drops (both API and Relay)
+- ✅ API HA validated (kill 1 API pod, Relay continues working)
+
+---
+
+## 10. Next Steps (Original Roadmap - Deferred)
+
+The following items are **deferred** in favor of Kubernetes production readiness (Phase 4):
+
+### ~~Phase 3.4: On-prem Connector~~ → **Moved to Phase 5.1**
 - Reverse tunnel for internal resources
 - Extend ACL for connector routing
 - IPAM persistence for production deployments
 
-### Phase 4: Policy Management API (Future)
+### ~~Phase 4: Policy Management API~~ → **Moved to Phase 5.2**
 - REST API for dynamic policy updates
 - Database backend for policy storage
 - Web UI for administration
