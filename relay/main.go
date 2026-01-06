@@ -23,6 +23,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/guni1192/zgate/relay/acl"
+	"github.com/guni1192/zgate/relay/api"
 	"github.com/guni1192/zgate/relay/audit"
 	"github.com/guni1192/zgate/relay/internal"
 	"github.com/guni1192/zgate/relay/ipam"
@@ -46,11 +47,18 @@ var (
 	aclEngine      *acl.Engine
 	auditLogger    *audit.Logger
 	sysLogger      *slog.Logger
+	healthChecker  *api.HealthChecker
 )
 
 func main() {
 	// Initialize system logger first
 	sysLogger = logger.New(os.Stdout, slog.LevelInfo)
+
+	// Initialize health checker (before other components)
+	healthChecker = api.NewHealthChecker("phase-3.3")
+
+	// Start health check server (HTTP/1.1 on port 8080)
+	go startHealthServer()
 
 	// Get OS-specific configuration (internal/net_*.go)
 	config := internal.GetWaterConfig()
@@ -139,6 +147,12 @@ func main() {
 		slog.String("network", VirtualIPRange),
 		slog.Int("total_ips", stats.TotalIPs),
 		slog.Int("available_ips", stats.AvailableIPs),
+	)
+
+	// Mark service as ready (IPAM and ACL are initialized)
+	healthChecker.SetReady(true)
+	sysLogger.Info("Service ready",
+		slog.String("component", "System"),
 	)
 
 	// TLS configuration
@@ -561,4 +575,28 @@ func generateTLSConfig() *tls.Config {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	tlsCert, _ := tls.X509KeyPair(certPEM, keyPEM)
 	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"h3"}}
+}
+
+// startHealthServer starts the HTTP/1.1 health check server on port 8080
+func startHealthServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthChecker.LivenessHandler)
+	mux.HandleFunc("/ready", healthChecker.ReadinessHandler)
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	sysLogger.Info("Starting health check server",
+		slog.String("component", "API"),
+		slog.String("address", ":8080"),
+	)
+
+	if err := server.ListenAndServe(); err != nil {
+		sysLogger.Error("Health server failed",
+			slog.String("component", "API"),
+			slog.String("error", err.Error()),
+		)
+	}
 }
