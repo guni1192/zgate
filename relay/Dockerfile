@@ -2,8 +2,13 @@ FROM golang:1.25.5-bookworm AS builder
 
 WORKDIR /build
 
+# Copy root go.mod and pkg/ for capsule package
+COPY go.mod go.sum ./
+COPY pkg/ ./pkg/
+
 # Copy relay go.mod and go.sum
-COPY relay/go.mod relay/go.sum ./
+COPY relay/go.mod relay/go.sum ./relay/
+WORKDIR /build/relay
 RUN go mod download
 
 # Copy relay source (includes policy, audit, acl, session, internal)
@@ -21,7 +26,7 @@ RUN apt-get update && apt-get install -y \
     iptables \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/zgate-relay /zgate-relay
+COPY --from=builder /build/relay/zgate-relay /zgate-relay
 COPY relay/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

@@ -4,7 +4,6 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +14,8 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/guni1192/zgate/pkg/capsule"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 )
@@ -81,7 +82,10 @@ func main() {
 	// 4. HTTP/3 Transport (共通)
 	tr := &http3.Transport{
 		TLSClientConfig: tlsConfig,
-		// QuicConfig:      &quic.Config{KeepAlivePeriod: 10 * time.Second},
+		QUICConfig: &quic.Config{
+			KeepAlivePeriod: 10 * time.Second,   // Send keep-alive every 10 seconds
+			MaxIdleTimeout:  300 * time.Second,   // 5 minutes idle timeout
+		},
 		EnableDatagrams: true,
 	}
 	defer tr.Close()
@@ -106,9 +110,12 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 	req.Header.Set("Protocol", "connect-ip")
 
 	// Upstream: TUN -> Request Body
+	// Using RFC 9297 Capsule Protocol
 	go func() {
 		defer pw.Close()
 		buf := make([]byte, 2000)
+		capsuleWriter := capsule.NewCapsuleWriter(pw)
+
 		for {
 			n, err := iface.Read(buf)
 			if err != nil {
@@ -117,8 +124,12 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 			// ログ出力 (簡易版)
 			// logPacketDetails(buf[:n])
 
-			binary.Write(pw, binary.BigEndian, uint16(n))
-			pw.Write(buf[:n])
+			// Encapsulate as IP_PACKET capsule
+			cap := capsule.NewIPPacketCapsule(buf[:n])
+			if err := capsuleWriter.WriteCapsule(cap); err != nil {
+				log.Printf("[Agent] Capsule send error: %v", err)
+				return
+			}
 		}
 	}()
 
@@ -132,16 +143,34 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 		return fmt.Errorf("status: %s", resp.Status)
 	}
 
-	// Read Virtual IP configuration from response headers
-	assignedIP := resp.Header.Get("Zgate-Virtual-IP")
-	gatewayIP := resp.Header.Get("Zgate-Gateway-IP")
+	// Read Virtual IP configuration from ADDRESS_ASSIGN capsule (RFC 9484)
+	capsuleReader := capsule.NewCapsuleReader(resp.Body)
 
-	if assignedIP == "" || gatewayIP == "" {
-		return fmt.Errorf("relay did not provide Virtual IP assignment (got IP=%s, Gateway=%s)", assignedIP, gatewayIP)
+	// Read first capsule (must be ADDRESS_ASSIGN)
+	cap, err := capsuleReader.ReadCapsule()
+	if err != nil {
+		return fmt.Errorf("read ADDRESS_ASSIGN capsule: %w", err)
 	}
 
+	if cap.Type != capsule.CapsuleTypeAddressAssign {
+		return fmt.Errorf("expected ADDRESS_ASSIGN (type %d), got type %d", capsule.CapsuleTypeAddressAssign, cap.Type)
+	}
+
+	assign, err := capsule.DecodeAddressAssign(cap)
+	if err != nil {
+		return fmt.Errorf("decode ADDRESS_ASSIGN: %w", err)
+	}
+
+	if len(assign.Assignments) == 0 {
+		return fmt.Errorf("no IP assignments in ADDRESS_ASSIGN capsule")
+	}
+
+	firstAssign := assign.Assignments[0]
+	assignedIP := firstAssign.IPAddress.String()
+	gatewayIP := "10.100.0.1" // Hard-coded for now (Phase 3.3: ROUTE_ADVERTISEMENT)
+
 	// Configure TUN interface with assigned Virtual IP
-	log.Printf("Assigned Virtual IP: %s, Gateway: %s", assignedIP, gatewayIP)
+	log.Printf("Assigned Virtual IP: %s/%d, Gateway: %s", assignedIP, firstAssign.PrefixLength, gatewayIP)
 	if err := configureInterface(iface.Name(), assignedIP, gatewayIP, MTU); err != nil {
 		return fmt.Errorf("failed to configure interface: %w", err)
 	}
@@ -164,21 +193,27 @@ func startStreamTunnel(client *http.Client, iface *water.Interface) error {
 	log.Println("--- Tunnel Established! ---")
 
 	// Downstream: Response Body -> TUN
-	lenBuf := make([]byte, 2)
-	pBuf := make([]byte, 2000)
+	// capsuleReader already created above
 	for {
-		if _, err := io.ReadFull(resp.Body, lenBuf); err != nil {
-			return err
-		}
-		plen := binary.BigEndian.Uint16(lenBuf)
-		if _, err := io.ReadFull(resp.Body, pBuf[:plen]); err != nil {
+		cap, err := capsuleReader.ReadCapsule()
+		if err != nil {
 			return err
 		}
 
-		// ログ出力 (ICMP Type確認用)
-		logPacketDetails(pBuf[:plen])
+		switch cap.Type {
+		case capsule.CapsuleTypeIPPacket:
+			// ログ出力 (ICMP Type確認用)
+			logPacketDetails(cap.Value)
 
-		iface.Write(pBuf[:plen])
+			iface.Write(cap.Value)
+
+		case capsule.CapsuleTypeRouteAdvertisement:
+			log.Printf("[Agent] ROUTE_ADVERTISEMENT (not implemented)")
+
+		default:
+			// RFC 9297: Unknown capsule types are silently discarded
+			log.Printf("[Agent] Unknown capsule type %d (discarding)", cap.Type)
+		}
 	}
 }
 

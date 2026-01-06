@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -18,6 +17,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/guni1192/zgate/pkg/capsule"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/guni1192/zgate/relay/acl"
@@ -26,6 +27,7 @@ import (
 	"github.com/guni1192/zgate/relay/ipam"
 	"github.com/guni1192/zgate/relay/policy"
 	"github.com/guni1192/zgate/relay/session"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 )
@@ -124,7 +126,10 @@ func main() {
 		Handler:         handler,
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
-		// QuicConfig:      &quic.Config{KeepAlivePeriod: 10 * time.Second},
+		QUICConfig: &quic.Config{
+			KeepAlivePeriod: 10 * time.Second,  // Send keep-alive every 10 seconds
+			MaxIdleTimeout:  300 * time.Second,  // 5 minutes idle timeout
+		},
 	}
 
 	log.Printf("Listening on QUIC %s", BindAddr)
@@ -173,14 +178,44 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 		log.Printf("Client disconnected: %s (CN: %s), Virtual IP: %s", sourceIP, clientID, virtualIP.String())
 	}()
 
-	// Send Virtual IP configuration to agent via HTTP headers
-	w.Header().Set("Zgate-Virtual-IP", virtualIP.String())
-	w.Header().Set("Zgate-Gateway-IP", ServerIP)
-	w.Header().Set("Zgate-Subnet-Mask", "255.255.255.0")
+	// Send HTTP 200 OK first
 	w.WriteHeader(http.StatusOK)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+
+	// Send Virtual IP configuration to agent via ADDRESS_ASSIGN capsule (RFC 9484)
+	assignCapsule := &capsule.AddressAssignCapsule{
+		Assignments: []capsule.AddressAssignment{
+			{
+				RequestID:    0,
+				IPVersion:    4,
+				IPAddress:    virtualIP,
+				PrefixLength: 32,
+			},
+		},
+	}
+
+	cap, err := assignCapsule.Encode()
+	if err != nil {
+		log.Printf("[IPAM] Failed to encode ADDRESS_ASSIGN for %s: %v", clientID, err)
+		return
+	}
+
+	// Create single CapsuleWriter for all downstream traffic
+	capsuleWriter := capsule.NewCapsuleWriter(w)
+
+	// Send ADDRESS_ASSIGN capsule first
+	if err := capsuleWriter.WriteCapsule(cap); err != nil {
+		log.Printf("[IPAM] Failed to send ADDRESS_ASSIGN to %s: %v", clientID, err)
+		return
+	}
+
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	log.Printf("[IPAM] Sent ADDRESS_ASSIGN to %s: %s/32", clientID, virtualIP)
 
 	// --- 読み書きの並行処理 ---
 
@@ -188,70 +223,77 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 	errChan := make(chan error, 2)
 
 	// A. Upstream: Request Body -> TUN (Clientから来たパケットをOSへ)
+	// Using RFC 9297 Capsule Protocol
 	go func() {
-		lenBuf := make([]byte, 2)
-		packetBuf := make([]byte, 2000)
+		capsuleReader := capsule.NewCapsuleReader(r.Body)
+
 		for {
-			// Length Header
-			if _, err := io.ReadFull(r.Body, lenBuf); err != nil {
-				errChan <- err
-				return
-			}
-			plen := binary.BigEndian.Uint16(lenBuf)
-
-			// Payload
-			if _, err := io.ReadFull(r.Body, packetBuf[:plen]); err != nil {
+			cap, err := capsuleReader.ReadCapsule()
+			if err != nil {
 				errChan <- err
 				return
 			}
 
-			// Extract packet info for ACL check
-			packetInfo := extractPacketInfo(packetBuf[:plen])
-			if packetInfo == nil {
-				continue // Invalid packet
-			}
+			switch cap.Type {
+			case capsule.CapsuleTypeIPPacket:
+				packetBuf := cap.Value
 
-			// ACL Check
-			result, err := aclEngine.CheckAccess(clientID, packetInfo)
-			if err != nil {
-				log.Printf("[ACL] Error checking access for %s: %v", clientID, err)
-				continue
-			}
+				// Extract packet info for ACL check
+				packetInfo := extractPacketInfo(packetBuf)
+				if packetInfo == nil {
+					continue // Invalid packet
+				}
 
-			// Log ACL decision
-			auditLogger.LogACL(clientID, packetInfo.DstIP.String(),
-				string(result.Action), result.RuleID, result.Reason)
+				// ACL Check
+				result, err := aclEngine.CheckAccess(clientID, packetInfo)
+				if err != nil {
+					log.Printf("[ACL] Error checking access for %s: %v", clientID, err)
+					continue
+				}
 
-			if result.Action == policy.ActionDeny {
-				log.Printf("[ACL] DENY %s -> %s (rule: %s)", clientID, packetInfo.DstIP, result.RuleID)
-				continue // Drop packet
-			}
+				// Log ACL decision
+				auditLogger.LogACL(clientID, packetInfo.DstIP.String(),
+					string(result.Action), result.RuleID, result.Reason)
 
-			// Allow: Write to TUN
-			sess.AddBytesReceived(uint64(plen))
-			_, err = tun.Write(packetBuf[:plen])
-			if err != nil {
-				log.Printf("TUN Write Error: %v", err)
+				if result.Action == policy.ActionDeny {
+					log.Printf("[ACL] DENY %s -> %s (rule: %s)", clientID, packetInfo.DstIP, result.RuleID)
+					continue // Drop packet
+				}
+
+				// Allow: Write to TUN
+				sess.AddBytesReceived(uint64(len(packetBuf)))
+				_, err = tun.Write(packetBuf)
+				if err != nil {
+					log.Printf("TUN Write Error: %v", err)
+				}
+
+			default:
+				// RFC 9297: Unknown capsule types are silently discarded
+				log.Printf("[Capsule] Unknown type %d from %s (discarding)", cap.Type, clientID)
 			}
 		}
 	}()
 
 	// B. Downstream: Pipe -> Response Body (OSから来たパケットをClientへ)
 	// handleTunRead が pw に書き込んだデータを、HTTP レスポンスとして送り返す
+	// Using RFC 9297 Capsule Protocol
+	// IMPORTANT: Reuse the same capsuleWriter created above to avoid race conditions
 	go func() {
 		buf := make([]byte, 2000)
+
 		for {
 			// パイプから読む (パケット単位で書き込まれている想定)
 			n, err := pr.Read(buf)
 			if err != nil {
+				log.Printf("[Downstream] Pipe read error for %s: %v", clientID, err)
 				errChan <- err
 				return
 			}
 
-			// Length Prefix を付けて HTTP Response Body へ
-			binary.Write(w, binary.BigEndian, uint16(n))
-			_, err = w.Write(buf[:n])
-			if err != nil {
+			// Encapsulate as IP_PACKET capsule
+			cap := capsule.NewIPPacketCapsule(buf[:n])
+			if err := capsuleWriter.WriteCapsule(cap); err != nil {
+				log.Printf("[Downstream] Capsule write error for %s: %v", clientID, err)
 				errChan <- err
 				return
 			}
