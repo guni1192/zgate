@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     ca-certificates \
     iputils-ping \
+    netcat-openbsd \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/agent/zgate-agent /zgate-agent

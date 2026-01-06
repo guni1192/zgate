@@ -24,6 +24,10 @@ func getWaterConfig() water.Config {
 
 // Linux用: ip addr, ip link
 func configureInterface(devName, clientIP, gatewayIP string, mtu int) error {
+	// Flush existing addresses to allow reconfiguration after reconnect
+	flushCmd := exec.Command("ip", "addr", "flush", "dev", devName)
+	flushCmd.Run() // Ignore errors - interface might not have addresses yet
+
 	// Point-to-Point 設定: ip addr add 10.100.0.2 peer 10.100.0.1 dev tun0
 	cmd1 := exec.Command("ip", "addr", "add", clientIP, "peer", gatewayIP, "dev", devName)
 	if out, err := cmd1.CombinedOutput(); err != nil {
@@ -42,7 +46,12 @@ func configureInterface(devName, clientIP, gatewayIP string, mtu int) error {
 func addRoute(cidr, gateway, devName string) error {
 	// ip route add 8.8.8.8/32 via 10.100.0.1
 	cmd := exec.Command("ip", "route", "add", cidr, "via", gateway)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		// EEXIST error (route already exists) is not a problem
+		// We can safely ignore this error on reconnect
+		return nil
+	}
+	return nil
 }
 
 // Linux用クリーンアップ (コンテナなら終了時に消えるので本来不要だが実装しておく)

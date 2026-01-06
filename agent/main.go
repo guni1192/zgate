@@ -15,6 +15,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/guni1192/zgate/pkg/capsule"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 )
@@ -81,7 +82,10 @@ func main() {
 	// 4. HTTP/3 Transport (共通)
 	tr := &http3.Transport{
 		TLSClientConfig: tlsConfig,
-		// QuicConfig:      &quic.Config{KeepAlivePeriod: 10 * time.Second},
+		QUICConfig: &quic.Config{
+			KeepAlivePeriod: 10 * time.Second,   // Send keep-alive every 10 seconds
+			MaxIdleTimeout:  300 * time.Second,   // 5 minutes idle timeout
+		},
 		EnableDatagrams: true,
 	}
 	defer tr.Close()

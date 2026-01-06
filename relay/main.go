@@ -27,6 +27,7 @@ import (
 	"github.com/guni1192/zgate/relay/ipam"
 	"github.com/guni1192/zgate/relay/policy"
 	"github.com/guni1192/zgate/relay/session"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 )
@@ -125,7 +126,10 @@ func main() {
 		Handler:         handler,
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
-		// QuicConfig:      &quic.Config{KeepAlivePeriod: 10 * time.Second},
+		QUICConfig: &quic.Config{
+			KeepAlivePeriod: 10 * time.Second,  // Send keep-alive every 10 seconds
+			MaxIdleTimeout:  300 * time.Second,  // 5 minutes idle timeout
+		},
 	}
 
 	log.Printf("Listening on QUIC %s", BindAddr)
@@ -198,7 +202,10 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 		return
 	}
 
+	// Create single CapsuleWriter for all downstream traffic
 	capsuleWriter := capsule.NewCapsuleWriter(w)
+
+	// Send ADDRESS_ASSIGN capsule first
 	if err := capsuleWriter.WriteCapsule(cap); err != nil {
 		log.Printf("[IPAM] Failed to send ADDRESS_ASSIGN to %s: %v", clientID, err)
 		return
@@ -270,14 +277,15 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 	// B. Downstream: Pipe -> Response Body (OSから来たパケットをClientへ)
 	// handleTunRead が pw に書き込んだデータを、HTTP レスポンスとして送り返す
 	// Using RFC 9297 Capsule Protocol
+	// IMPORTANT: Reuse the same capsuleWriter created above to avoid race conditions
 	go func() {
 		buf := make([]byte, 2000)
-		capsuleWriter := capsule.NewCapsuleWriter(w)
 
 		for {
 			// パイプから読む (パケット単位で書き込まれている想定)
 			n, err := pr.Read(buf)
 			if err != nil {
+				log.Printf("[Downstream] Pipe read error for %s: %v", clientID, err)
 				errChan <- err
 				return
 			}
@@ -285,6 +293,7 @@ func handleMasqueRequest(w http.ResponseWriter, r *http.Request, tun *water.Inte
 			// Encapsulate as IP_PACKET capsule
 			cap := capsule.NewIPPacketCapsule(buf[:n])
 			if err := capsuleWriter.WriteCapsule(cap); err != nil {
+				log.Printf("[Downstream] Capsule write error for %s: %v", clientID, err)
 				errChan <- err
 				return
 			}
