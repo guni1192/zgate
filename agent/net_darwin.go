@@ -12,14 +12,14 @@ import (
 	"github.com/songgao/water"
 )
 
-// macOS用: デバイス名はOS任せ
+// For macOS: Let OS determine device name
 func getWaterConfig() water.Config {
 	return water.Config{
 		DeviceType: water.TUN,
 	}
 }
 
-// macOS用: ifconfig
+// For macOS: ifconfig
 func configureInterface(devName, clientIP, gatewayIP string, mtu int) error {
 	cmd := exec.Command("ifconfig", devName, clientIP, gatewayIP, "mtu", fmt.Sprintf("%d", mtu), "up")
 	output, err := cmd.CombinedOutput()
@@ -29,14 +29,14 @@ func configureInterface(devName, clientIP, gatewayIP string, mtu int) error {
 	return nil
 }
 
-// macOS用: route add
+// For macOS: route add
 func addRoute(cidr, gateway, devName string) error {
-	// macOSではデバイス指定よりGateway指定が一般的
+	// On macOS, Gateway specification is more common than device specification
 	cmd := exec.Command("route", "-n", "add", "-net", cidr, gateway)
 	return cmd.Run()
 }
 
-// クリーンアップ
+// Cleanup
 func setupCleanup(cidr, gateway, devName string) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
