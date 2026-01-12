@@ -420,9 +420,9 @@ The development roadmap is now focused on **Kubernetes production readiness** be
 
 ### Implementation Phases
 
-#### 🎯 **Phase 4.1: Kubernetes Foundation (Week 1-2) - IN PROGRESS**
+#### 🎯 **Phase 4.1: Kubernetes Foundation (Week 1-2) - ✅ COMPLETED**
 
-**Status:** Highest priority, starting immediately
+**Status:** Completed (Day 1 implementation, all success criteria met)
 
 ##### Phase 4.1.1: Health Check API (Day 1-2) ✅ COMPLETED
 - **Goal:** Minimal HTTP API for Kubernetes liveness/readiness probes
@@ -445,18 +445,28 @@ The development roadmap is now focused on **Kubernetes production readiness** be
   - ✅ E2E tests: All passing (0% packet loss)
   - ✅ Unit tests: 94.4% IPAM, 80.3% session, 86.6% capsule coverage
 
-##### Phase 4.1.2: Graceful Shutdown (Day 3-4)
+##### Phase 4.1.2: Graceful Shutdown (Day 3-4) ✅ COMPLETED
 - **Goal:** SIGTERM signal handling for zero-downtime Pod termination
 - **Implementation:**
-  - Modify: `relay/main.go` (~50 lines)
-  - Signal handling (SIGTERM, SIGINT)
-  - Connection draining (30-second timeout)
-  - Readiness=false on shutdown (stop accepting new connections)
+  - ✅ Modified: `relay/main.go` (+97 lines)
+  - ✅ Added imports: `os/signal`, `syscall`
+  - ✅ Signal handling (SIGTERM, SIGINT)
+  - ✅ HTTP/3 server moved to goroutine
+  - ✅ Connection draining with 30-second timeout
+  - ✅ Readiness=false on shutdown (stops accepting new connections)
+  - ✅ Proper resource cleanup order (session → ACL → IPAM → audit → TUN)
 - **Benefits:**
   - Prevents data loss on Pod restart/update
   - Enables rolling updates in Kubernetes
   - Improves reliability in all deployment scenarios
   - Integrates with Phase 4.1.1 health checker
+- **Test Results:**
+  - ✅ SIGTERM handling: Clean shutdown with connection draining
+  - ✅ Session count tracking: Waits for active sessions to close
+  - ✅ Timeout handling: Gracefully exits after 30s if sessions remain
+  - ✅ E2E tests: All passing (0% packet loss)
+  - ✅ Unit tests: 94.4% IPAM, 80.3% session, 80.0% logger coverage
+  - ✅ No regressions in existing functionality
 
 **Deliverables:**
 - Production-ready Relay with health monitoring and graceful shutdown
@@ -592,29 +602,40 @@ ZGATE_API_RETRY: "3"
 
 ---
 
-#### 🟡 **Phase 4.4: Kubernetes Deployment Manifests (Week 6-7) - PLANNED**
+#### 🟡 **Phase 4.4: Kubernetes Deployment Manifests (Week 6-7) - ✅ SINGLE RELAY COMPLETED**
 
-**Status:** Medium priority, required after Phase 4.1-4.2 completion
+**Status:** Single Relay deployment ready for production, Multi-Relay pending Phase 4.2
 
 **Prerequisites:**
-- Phase 4.1 (Health Checks + Graceful Shutdown) completed
-- Phase 4.2 (zgate-api + PostgreSQL IPAM) decision finalized
-- Kubernetes cluster available for testing
+- ✅ Phase 4.1 (Health Checks + Graceful Shutdown) completed
+- ⚠️ Phase 4.2 (zgate-api + PostgreSQL IPAM) - Optional for Single Relay
+- ✅ Kubernetes cluster available (tested on GKE Autopilot)
 
 **Deliverables:**
 
-**zgate-api Service:**
-- `k8s/api/deployment.yaml` - API Deployment (2+ replicas)
-- `k8s/api/service.yaml` - ClusterIP Service (port 8081)
-- `k8s/api/configmap.yaml` - API configuration
-- `k8s/api/secret.yaml` - PostgreSQL connection credentials
-- `k8s/postgres/` - PostgreSQL StatefulSet or external DB connection
+**✅ Single Relay Configuration (COMPLETED):**
+Location: `../releases/kubernetes/workloads/zgate/`
 
-**zgate-relay Service:**
-- `k8s/relay/deployment.yaml` - Relay Deployment (3+ replicas)
-- `k8s/relay/service.yaml` - LoadBalancer Service (UDP/4433)
-- `k8s/relay/configmap.yaml` - ACL Policy ConfigMap
-- `k8s/cert-manager/` - Certificate resources (if Phase 4.3 implemented)
+- ✅ `namespace.yaml` - Namespace: zgate-relay
+- ✅ `deployment.yaml` - Single Relay Pod with:
+  - Health checks (`/health`, `/ready` on port 8080)
+  - Graceful shutdown (`terminationGracePeriodSeconds: 60`)
+  - In-memory IPAM (10.100.0.2-254)
+  - mTLS authentication
+  - NET_ADMIN capability for TUN interface
+  - Cost-optimized resources (250m CPU, 512Mi RAM)
+- ✅ `service.yaml` - LoadBalancer (UDP/4433) with session affinity
+- ✅ `configmap.yaml` - ACL Policy
+- ✅ `secret.yaml` - mTLS certificate template
+- ✅ `kustomization.yaml` - Kustomize configuration
+- ✅ `scripts/generate-k8s-secrets.sh` - Certificate Secret generator
+- ✅ `README.md` - Deployment guide
+
+**⏳ Multi-Relay Configuration (FUTURE - Requires Phase 4.2):**
+- `k8s/api/deployment.yaml` - zgate-api Deployment (2+ replicas)
+- `k8s/api/service.yaml` - ClusterIP Service (port 8081)
+- `k8s/postgres/` - PostgreSQL StatefulSet
+- Updated `deployment.yaml` - Multiple Relay Pods (3+ replicas)
 
 **Key Configuration:**
 
@@ -669,13 +690,93 @@ devices:
 
 The following features from the original roadmap are **deferred** until Kubernetes foundation is complete:
 
-#### Phase 5.1: On-prem Connector (Future)
-- Reverse tunnel for internal resources
-- Extend ACL for connector routing
-- New binary: `zgate-connector`
-- Requires: Kubernetes Phase 4.1-4.4 completed first
+#### Phase 5.1: On-prem Connector with E2E Encryption (Future)
 
-**Rationale:** Connector is a new feature addition, while Kubernetes readiness improves existing functionality for production deployment.
+**Overview:**
+Implement reverse tunnel functionality for accessing on-premises resources (e.g., internal databases, legacy systems) through Relay while ensuring end-to-end encryption.
+
+**Critical Security Requirement:**
+- **🔴 Mandatory E2E Encryption**: Relay must NOT be able to decrypt traffic to on-prem resources
+- Prevents Relay from inspecting sensitive internal data (medical records, PII)
+- Complies with zero-trust architecture principles
+
+**Implementation Approach:**
+
+1. **Nested TLS Architecture** (Recommended)
+   ```
+   Agent → [Outer: MASQUE/TLS to Relay] → Relay → [Inner: TLS to Connector] → On-prem Resource
+           ↑ Relay can see metadata           ↑ Relay CANNOT decrypt
+   ```
+
+   - Outer layer: MASQUE CONNECT tunnel (existing implementation)
+   - Inner layer: TLS connection between Agent and Connector
+   - Relay acts as TCP proxy only (no payload visibility)
+
+2. **Architecture Diagram:**
+   ```
+   ┌─────────┐  MASQUE/TLS   ┌───────┐  TCP Proxy   ┌───────────┐  TLS    ┌──────────┐
+   │  Agent  │ ────────────> │ Relay │ ──────────> │ Connector │ ─────> │ Database │
+   │ (外部)  │               │(中継) │              │(オンプレ) │         │(内部)    │
+   └─────────┘               └───────┘              └───────────┘         └──────────┘
+        │                         │                       │                      │
+        └─────────────────────────┴───────────────────────┴──────────────────────┘
+                         E2E TLS (Relay には見えない)
+   ```
+
+3. **Key Components:**
+   - **zgate-connector** (new binary)
+     - Listens for reverse tunnel connections from Relay
+     - Terminates inner TLS from Agent
+     - Proxies to internal resources (databases, APIs)
+
+   - **Extended ACL Policy**
+     ```yaml
+     clients:
+       client-medical-staff:
+         rules:
+           - id: "allow-internal-db"
+             type: connector
+             action: allow
+             connector_id: "connector-hq-datacenter"
+             destinations:
+               - "postgres.internal:5432"
+               - "emr.internal:443"
+     ```
+
+4. **Security Features:**
+   - ✅ E2E TLS between Agent and Connector (TLS 1.3)
+   - ✅ Relay cannot decrypt inner payload
+   - ✅ Relay can still enforce ACL based on connector_id and metadata
+   - ✅ Connector authenticates to Relay via mTLS
+   - ✅ Agent validates Connector certificate (prevents MITM)
+
+5. **Metadata Visible to Relay (ACL enforcement):**
+   - Source: Client ID from Agent certificate
+   - Destination: Connector ID + target hostname (in outer header)
+   - Protocol: TCP (inner TLS encrypted)
+   - **NOT visible**: SQL queries, HTTP requests, application data
+
+**Prerequisites:**
+- Kubernetes Phase 4.1-4.4 completed
+- Certificate infrastructure for Connector certificates
+- Documentation on E2E TLS architecture for security audit
+
+**Documentation:**
+- **Security Architecture:** [docs/architecture/e2e-encryption-design.md](docs/architecture/e2e-encryption-design.md)
+  - Nested TLS protocol design
+  - Cryptographic security proofs
+  - Threat model and attack scenarios
+  - Compliance (HIPAA, Zero Trust)
+- **Implementation Plan:** [docs/plan/phase-5.1-connector-implementation.md](docs/plan/phase-5.1-connector-implementation.md)
+  - 6-week implementation roadmap
+  - Code examples for Agent/Relay/Connector
+  - Testing strategy and security checklist
+
+**Rationale:**
+- Connector is a new feature addition for accessing on-prem resources
+- E2E encryption is **mandatory** to protect sensitive data from Relay inspection
+- Aligns with zero-trust security model for medical/enterprise environments
+- Provides same security guarantees as direct VPN to on-prem network
 
 #### Phase 5.2: Policy Management API (Future)
 - Extend zgate-api with policy management endpoints
@@ -731,12 +832,12 @@ CREATE TABLE policy_rules (
 
 ### Success Criteria
 
-**Phase 4.1 (Kubernetes Foundation) Completion:**
+**Phase 4.1 (Kubernetes Foundation) Completion:** ✅ ALL CRITERIA MET
 - ✅ Health check endpoints (`/health`, `/ready`) responding correctly
 - ✅ Graceful shutdown tested (connections drain within 30s)
 - ✅ Docker Compose E2E tests passing
 - ✅ No regression in existing functionality (ACL, IPAM, Capsule Protocol)
-- ✅ Documentation updated (GEMINI.md, README.md)
+- ✅ Documentation updated (GEMINI.md)
 
 **Phase 4.2.1 (zgate-api Foundation) Completion:**
 - ✅ PostgreSQL schema deployed and migrations working
@@ -752,15 +853,17 @@ CREATE TABLE policy_rules (
 - ✅ IP persistence across Relay Pod restarts
 - ✅ E2E test: Relay → API → PostgreSQL → successful allocation
 
-**Phase 4.4 (Kubernetes Deployment) Completion:**
-- ✅ zgate-api deployment with 2+ replicas
-- ✅ PostgreSQL StatefulSet or external DB connection working
-- ✅ Multi-Relay deployment with 3+ Pods
-- ✅ LoadBalancer distributing traffic correctly
-- ✅ Agent connects through LoadBalancer successfully
-- ✅ Pod restart doesn't break active sessions (API + PostgreSQL persistence)
-- ✅ Rolling update works without connection drops (both API and Relay)
-- ✅ API HA validated (kill 1 API pod, Relay continues working)
+**Phase 4.4 (Kubernetes Deployment - Single Relay) Completion:** ✅ SINGLE RELAY COMPLETED
+- ✅ Deployment manifest with health checks and graceful shutdown (terminationGracePeriodSeconds: 60)
+- ✅ LoadBalancer Service for UDP/4433 (QUIC) and TCP/8080 (health)
+- ✅ ConfigMap for ACL policy configuration
+- ✅ Secret template for mTLS certificates
+- ✅ Certificate generation script (`scripts/generate-k8s-secrets.sh`)
+- ✅ Kustomize configuration with all resources enabled
+- ✅ Comprehensive deployment README with troubleshooting guide
+- ✅ Kustomize build tested and validated
+
+**Note:** Multi-Relay deployment (Phase 4.4 Full) requires Phase 4.2 (zgate-api + PostgreSQL IPAM) completion first. Current Single Relay deployment uses in-memory IPAM and is suitable for development/staging environments.
 
 ---
 

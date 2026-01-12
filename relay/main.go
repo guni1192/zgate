@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/guni1192/zgate/pkg/capsule"
@@ -198,13 +200,103 @@ func main() {
 		},
 	}
 
-	sysLogger.Info("Starting HTTP/3 server",
-		slog.String("component", "Server"),
-		slog.String("address", BindAddr),
-		slog.String("keep_alive", "10s"),
-		slog.String("max_idle_timeout", "300s"),
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Start HTTP/3 server in goroutine
+	go func() {
+		sysLogger.Info("Starting HTTP/3 server",
+			slog.String("component", "Server"),
+			slog.String("address", BindAddr),
+			slog.String("keep_alive", "10s"),
+			slog.String("max_idle_timeout", "300s"),
+		)
+		if err := server.ListenAndServe(); err != nil {
+			sysLogger.Error("Server error",
+				slog.String("component", "Server"),
+				slog.String("error", err.Error()),
+			)
+		}
+	}()
+
+	// Wait for shutdown signal
+	sig := <-sigChan
+	sysLogger.Info("Received shutdown signal",
+		slog.String("component", "System"),
+		slog.String("signal", sig.String()),
 	)
-	log.Fatal(server.ListenAndServe())
+
+	// Mark as not ready (stop accepting new connections)
+	healthChecker.SetReady(false)
+	sysLogger.Info("Service marked as not ready",
+		slog.String("component", "System"),
+	)
+
+	// Wait for existing connections to drain (max 30 seconds)
+	activeConns := sessionManager.Count()
+	sysLogger.Info("Draining connections",
+		slog.String("component", "System"),
+		slog.Int("active_sessions", activeConns),
+	)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer shutdownCancel()
+
+	// Close HTTP/3 server gracefully
+	if err := server.Close(); err != nil {
+		sysLogger.Error("Error closing server",
+			slog.String("component", "Server"),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	// Wait for all sessions to close or timeout
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownCtx.Done():
+			remaining := sessionManager.Count()
+			sysLogger.Warn("Shutdown timeout reached",
+				slog.String("component", "System"),
+				slog.Int("remaining_sessions", remaining),
+			)
+			goto cleanup
+		case <-ticker.C:
+			remaining := sessionManager.Count()
+			if remaining == 0 {
+				sysLogger.Info("All sessions closed",
+					slog.String("component", "System"),
+				)
+				goto cleanup
+			}
+			sysLogger.Debug("Waiting for sessions to close",
+				slog.String("component", "System"),
+				slog.Int("remaining_sessions", remaining),
+			)
+		}
+	}
+
+cleanup:
+	// Cleanup resources in proper order
+	sysLogger.Info("Cleaning up resources",
+		slog.String("component", "System"),
+	)
+
+	sessionManager.Close()
+	aclEngine.Close()
+	ipamAllocator.Close()
+	auditLogger.Close()
+	iface.Close()
+
+	sysLogger.Info("Shutdown complete",
+		slog.String("component", "System"),
+	)
 }
 
 // handleMasqueRequest: Process per-client connection

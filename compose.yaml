@@ -18,6 +18,7 @@ services:
       - ACL_POLICY_PATH=/etc/zgate/policy.yaml
     ports:
       - "4433:4433/udp"
+      - "8080:8080/tcp"
     networks:
       zgate-net:
         ipv4_address: 172.28.0.10
