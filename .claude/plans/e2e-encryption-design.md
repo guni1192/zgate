@@ -2,100 +2,116 @@
 
 ## 1. Executive Summary
 
-This document describes the **mandatory end-to-end (E2E) encryption architecture** for zgate Connector, ensuring that the Relay server cannot decrypt or inspect traffic between Agents and on-premises resources.
+This document defines the **E2E (End-to-End) encryption architecture between Agent (Client) and Connector** in zgate Connector.
+The Relay server relays traffic but is **technically incapable of decrypting the communication content**.
 
 **Security Goal:**
-- **Relay sees**: Metadata (ClientID, ConnectorID, destination hostname)
-- **Relay CANNOT see**: Application data (SQL queries, HTTP requests, database responses)
+- **Visible to Relay**: Metadata (ClientID, ConnectorID, destination hostname)
+- **Invisible to Relay**: Application data (SQL queries, HTTP requests, DB responses)
 
-**Legal Requirement (Japan):**
-- **E2E encryption is NOT optional** - it is a **legal mandate** under Japanese Telecommunications Business Act (電気通信事業法 Article 4)
-- Without E2E encryption, relay operators are criminally liable for violating "Secrecy of Communications" (通信の秘密)
-- **Penalty**: Up to 2 years imprisonment or fine up to 1 million yen (Article 179)
-- MIC Guidelines require **technical measures** to ensure relay servers cannot decrypt communication content
+**Legal Requirements (Japan):**
+The secrecy of communications is protected under Article 21(2) of the Japanese Constitution and Article 4 of the Telecommunications Business Act. If a Relay operator can access communication content, they face **criminal liability** (Article 179: imprisonment up to 2 years or fine up to 1 million yen). E2E encryption guarantees that the Relay is technically incapable of decryption. (See [Appendix A](#appendix-a-legal-background-details) for full legal background.)
 
-**Implementation Status:** 📋 Planning (Phase 5.1)
+**Implementation Status:** Planning (Phase 5.1)
 
 ---
 
-## 2. Legal and Regulatory Background
+## 2. System Architecture
 
-### 2.1 Japan: Secrecy of Communications (通信の秘密)
+### 2.1 Overall System Configuration
 
-**Constitutional and Legal Framework:**
+```mermaid
+graph LR
+    subgraph "Client Site"
+        App["User Application<br/>(Browser, DB Client)"]
+        Agent["Agent<br/>(zgate-agent)"]
+    end
 
-#### 2.1.1 Constitutional Protection
-**Article 21, Section 2 of the Constitution of Japan:**
-> "The secrecy of any means of communication is inviolable."
-> （通信の秘密は、これを侵してはならない。）
+    subgraph "Cloud / DMZ"
+        Relay["Relay<br/>(zgate-relay)"]
+    end
 
-This constitutional right **prohibits any entity**, including:
-- ✅ Telecommunications carriers (電気通信事業者)
-- ✅ Government agencies
-- ✅ Private service providers
+    subgraph "On-Prem Site"
+        Connector["Connector<br/>(zgate-connector)"]
+        DB[("Internal DB<br/>postgres:5432")]
+        WebApp["Internal Web App<br/>app.internal:443"]
+    end
 
-from inspecting, disclosing, or using the content of communications without legal authorization.
-
-#### 2.1.2 Telecommunications Business Act (電気通信事業法)
-**Article 4: Protection of Communications Secrecy**
-> "A person engaged in the telecommunications business must not violate the secrecy of communications handled by him/her."
-> （電気通信事業者の取扱中に係る通信の秘密は、侵してはならない。）
-
-**Penalties (Article 179):**
-- Criminal penalties: **Up to 2 years imprisonment or fine up to 1 million yen**
-- Applies to anyone who violates communications secrecy in the course of telecommunications business
-
-**Article 164, Section 2: Technical Compliance Requirement**
-> Telecommunications carriers must implement **technical measures** to prevent unauthorized access to communications.
-
-#### 2.1.3 Interpretation by Ministry of Internal Affairs and Communications (MIC)
-
-**Key Guidelines:**
-1. **"Handling" (取扱中)** includes:
-   - Transmission of data through servers/networks
-   - Temporary storage in relay nodes
-   - Any processing where content is accessible
-
-2. **Prohibited Actions:**
-   - ❌ Inspecting packet contents for non-transmission purposes
-   - ❌ Logging communication content (even for debugging)
-   - ❌ Using communication data for service optimization
-   - ✅ Allowed: Metadata for routing and billing (IP addresses, timestamps)
-
-3. **Technical Requirement:**
-   > "If a telecommunications carrier operates relay servers that **could technically access communication content**, the carrier must implement end-to-end encryption to ensure the relay **cannot decrypt** the content."
-
-**Critical Implication for zgate:**
-- If Relay can decrypt traffic between Agent and on-premises resources, **zgate operators are legally liable** for any inspection or logging of communication content.
-- **E2E encryption is NOT optional** - it is a **legal requirement** for compliance with Japanese telecommunications law.
-
-#### 2.1.4 Medical Data Protection (Additional Requirements)
-
-**Act on the Protection of Personal Information (個人情報保護法):**
-- Medical records are classified as **"Sensitive Personal Information" (要配慮個人情報)** (Article 2, Section 3)
-- Requires **stricter handling** than general personal data
-- Unauthorized disclosure: **Up to 1 year imprisonment or fine up to 500,000 yen** (Article 177)
-
-**Combined Legal Risk:**
-```
-Medical Institution → Agent → Relay → Connector → Database
-                               ↑
-                         If Relay can decrypt:
-                         - Violates "Secrecy of Communications" (電気通信事業法)
-                         - Exposes sensitive personal info (個人情報保護法)
-                         - Criminal liability for operators
+    App -->|"Plaintext"| Agent
+    Agent ==>|"Outer TLS<br/>(QUIC/HTTP3 + mTLS)"| Relay
+    Relay ==>|"Outer TLS<br/>(Reverse Tunnel + mTLS)"| Connector
+    Agent -.->|"Inner TLS 1.3 (E2E)<br/>Relay cannot decrypt"| Connector
+    Connector -->|"Plaintext"| DB
+    Connector -->|"Plaintext"| WebApp
 ```
 
-#### 2.1.5 Comparison with Other Jurisdictions
+### 2.2 Nested TLS Architecture
 
-| Jurisdiction | Legal Framework | Criminal Penalty | E2E Required? |
-|--------------|----------------|------------------|---------------|
-| **Japan** | Constitution Art. 21 + 電気通信事業法 Art. 4 | 2 years imprisonment | ✅ **Yes** (MIC interpretation) |
-| **USA** | ECPA + Wiretap Act | 5 years imprisonment | ⚠️ Depends (HIPAA for medical) |
-| **EU** | GDPR + ePrivacy Directive | 4% global revenue | ⚠️ Recommended (not mandated) |
-| **UK** | Investigatory Powers Act 2016 | Varies | ❌ No (lawful intercept allowed) |
+Agent and Connector establish E2E encryption via **Inner TLS** through the Relay. The Relay terminates Outer TLS but can only see the Inner TLS payload as opaque encrypted bytes.
 
-**Japan is among the strictest** in requiring telecommunications carriers to prevent technical access to communication content.
+```mermaid
+graph TB
+    subgraph InnerTLS["Inner TLS 1.3 (Agent ↔ Connector) - E2E Encrypted"]
+        direction TB
+        AppData["Application Data<br/>SQL: SELECT * FROM patients<br/>HTTP: POST /api/ehr/records"]
+    end
+
+    subgraph OuterTLS_AC["Outer TLS 1.3 (Agent ↔ Relay) - Transport"]
+        direction TB
+        Capsule1["Capsule Protocol (RFC 9297)<br/>Type: IP_PACKET (0x40)<br/>Payload: Inner TLS Records (opaque)"]
+    end
+
+    subgraph OuterTLS_RC["Outer TLS 1.3 (Relay ↔ Connector) - Transport"]
+        direction TB
+        Capsule2["TCP Stream Forwarding<br/>Payload: Inner TLS Records (opaque)"]
+    end
+
+    subgraph QUIC["QUIC Transport (UDP)"]
+        direction TB
+        QUICLayer["Connection ID, Stream Multiplexing<br/>Loss Recovery, Congestion Control"]
+    end
+
+    AppData --> InnerTLS
+    InnerTLS --> OuterTLS_AC
+    InnerTLS --> OuterTLS_RC
+    OuterTLS_AC --> QUIC
+    OuterTLS_RC --> QUIC
+```
+
+### 2.3 Protocol Layers
+
+| Layer | Protocol | Encryption | Endpoints | Purpose |
+|-------|----------|------------|-----------|---------|
+| **Application** | HTTP/SQL/etc | None (over Inner TLS) | App ↔ Internal Resource | Business logic |
+| **Inner TLS** | **TLS 1.3** | **Agent ↔ Connector** | Agent ↔ Connector | **E2E Encryption** |
+| **Capsule/Tunnel** | RFC 9297 / TCP Stream | Part of Outer TLS | Agent ↔ Relay / Relay ↔ Connector | Packet encapsulation |
+| **Outer TLS** | TLS 1.3 + mTLS | Hop-by-hop | Agent ↔ Relay, Relay ↔ Connector | Authentication & transport |
+| **Transport** | QUIC (UDP) | QUIC encryption | Per-hop | Loss recovery, congestion |
+
+### 2.4 Relay Visibility
+
+The following clarifies what information the Relay can and cannot access.
+
+```mermaid
+graph LR
+    subgraph Visible["Visible to Relay"]
+        M1["ClientID (mTLS cert CN)"]
+        M2["ConnectorID (CONNECT header)"]
+        M3["Destination hostname (CONNECT header)"]
+        M4["Connection timing / Traffic volume"]
+    end
+
+    subgraph Invisible["Invisible to Relay"]
+        E1["SQL query content"]
+        E2["HTTP request body"]
+        E3["DB response data"]
+        E4["Authentication tokens"]
+        E5["Medical records / PII"]
+    end
+
+    Relay["Relay Server"] --> Visible
+    Relay -.-x Invisible
+```
 
 ---
 
@@ -103,116 +119,24 @@ Medical Institution → Agent → Relay → Connector → Database
 
 ### 3.1 Attack Scenarios
 
-| Threat | Without E2E Encryption | With E2E Encryption |
-|--------|----------------------|-------------------|
-| **Relay Compromise** | Attacker sees all plaintext data | Attacker sees only metadata |
-| **Malicious Relay Operator** | Can log sensitive data (SQL, PII) | Cannot decrypt application data |
-| **Man-in-the-Middle (Relay)** | Can modify packets | Cannot modify encrypted payload |
-| **Compliance Violation (HIPAA/GDPR)** | Medical data exposed to 3rd party | Data encrypted end-to-end |
-| **Legal Violation (電気通信事業法)** | Operator liable for Art. 4 violation (2 years imprisonment) | ✅ No legal violation (cannot decrypt) |
+| Threat | Without E2E | With E2E |
+|--------|------------|----------|
+| **Relay Compromise** | All plaintext data leaked | Only metadata leaked |
+| **Malicious Relay Operator** | Can log SQL/PII | Cannot decrypt application data |
+| **Man-in-the-Middle (Relay)** | Can tamper with packets | Cannot tamper with encrypted payload |
+| **Compliance Violation** | Medical data exposed to third party | E2E encrypted |
+| **Telecom Business Act Art.4** | Criminal liability for operator | Technically incapable of decryption, compliant |
 
-### 2.2 Trust Assumptions
+### 3.2 Trust Assumptions
 
-✅ **Trusted Components:**
+**Trusted Components:**
 - Agent (client device)
 - Connector (on-premises gateway)
 - Certificate Authority (CA)
 
-❌ **Untrusted Components:**
-- **Relay Server** (considered a public/untrusted intermediary)
-- Network infrastructure between Agent ↔ Relay ↔ Connector
-
-**Legal Rationale (Japan):**
-- Under Japanese Telecommunications Business Act (電気通信事業法), **even the relay operator must not access communication content**
-- Treating Relay as "untrusted" ensures legal compliance regardless of operator's intent
-- This architectural decision protects operators from criminal liability (Art. 179: up to 2 years imprisonment)
-
----
-
-## 3. Encryption Architecture
-
-### 3.1 Nested TLS Design
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ Application Layer (E2E Encrypted)                                     │
-│                                                                        │
-│  Agent                Relay               Connector      On-Prem DB   │
-│    │                   │                      │               │       │
-│    │  ┌────────────────┼──────────────────────┤               │       │
-│    │  │ Inner TLS 1.3  │                      │               │       │
-│    │  │ (E2E Encrypted)│                      │               │       │
-│    ├──┴────────────────┼──────────────────────┴───────────────┤       │
-│    │  SQL Query        │  [Encrypted Blob]    │ SELECT * ...  │       │
-│    │  HTTP Request     │  [Opaque to Relay]   │ GET /api/...  │       │
-│    └───────────────────┼──────────────────────┴───────────────┘       │
-│                        │                                               │
-└────────────────────────┼───────────────────────────────────────────────┘
-                         │
-┌────────────────────────┼───────────────────────────────────────────────┐
-│ Transport Layer (Relay Visibility)                                     │
-│                        │                                               │
-│  Agent                Relay               Connector                    │
-│    │                   │                      │                        │
-│    ├───────────────────┤                      │                        │
-│    │ Outer TLS 1.3     │                      │                        │
-│    │ (MASQUE/QUIC)     │                      │                        │
-│    └───────────────────┘                      │                        │
-│                        │                      │                        │
-│                        ├──────────────────────┤                        │
-│                        │ Outer TLS 1.3        │                        │
-│                        │ (Reverse Tunnel)     │                        │
-│                        └──────────────────────┘                        │
-│                                                                        │
-│  Relay sees: ClientID, ConnectorID, Destination Hostname              │
-│  Relay CANNOT see: Inner TLS payload                                  │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### 3.2 Protocol Layers
-
-| Layer | Protocol | Encryption | Purpose |
-|-------|----------|------------|---------|
-| **Application** | HTTP/SQL/etc | None (over Inner TLS) | Business logic |
-| **Inner TLS** | **TLS 1.3** | **Agent ↔ Connector** | **E2E Encryption** |
-| **Tunnel Protocol** | MASQUE CONNECT | RFC 9297 Capsule | IP packet encapsulation |
-| **Outer TLS (Agent→Relay)** | TLS 1.3 + mTLS | Agent ↔ Relay | Authentication & transport |
-| **Outer TLS (Relay→Connector)** | TLS 1.3 + mTLS | Relay ↔ Connector | Reverse tunnel |
-| **Transport** | QUIC (UDP) | QUIC encryption | Loss recovery, congestion control |
-
-### 3.3 Encryption Hierarchy
-
-```
-+-----------------------------------------------------------------------+
-| Inner TLS 1.3 Session (Agent ↔ Connector)                             |
-| - Cipher: TLS_AES_256_GCM_SHA384 (AEAD)                               |
-| - Key Exchange: X25519 (ECDHE)                                        |
-| - Certificate: Connector cert (CN=connector-hq-datacenter)            |
-| - Payload: Application data (SQL, HTTP, etc.)                         |
-|   +---------------------------------------------------------------+   |
-|   | Application Data (Plaintext at endpoints only)                |   |
-|   | - SQL: SELECT * FROM patients WHERE id=12345                  |   |
-|   | - HTTP: POST /api/ehr/records Authorization: Bearer ...       |   |
-|   +---------------------------------------------------------------+   |
-+-------------------------------|----------------------------------------+
-                                ▼
-+-----------------------------------------------------------------------+
-| Outer TLS 1.3 Session (Agent ↔ Relay)                                 |
-| - Cipher: TLS_CHACHA20_POLY1305_SHA256                                |
-| - mTLS: Agent cert (CN=client-1)                                      |
-| - Payload: Capsule Protocol frames containing Inner TLS records       |
-|   +---------------------------------------------------------------+   |
-|   | Capsule Type: IP_PACKET (0x00)                                |   |
-|   | Payload: TCP packet containing encrypted Inner TLS data      |   |
-|   +---------------------------------------------------------------+   |
-+-----------------------------------------------------------------------+
-                                ▼
-+-----------------------------------------------------------------------+
-| QUIC Transport (Agent ↔ Relay)                                        |
-| - QUIC encryption (additional layer)                                  |
-| - Connection ID, Stream multiplexing                                  |
-+-----------------------------------------------------------------------+
-```
+**Untrusted Components:**
+- **Relay Server** (public/untrusted relay node)
+- Network between Agent ↔ Relay ↔ Connector
 
 ---
 
@@ -220,94 +144,128 @@ Medical Institution → Agent → Relay → Connector → Database
 
 ### 4.1 Certificate Hierarchy
 
-```
-                    Root CA (zgate-ca)
-                         │
-         ┌───────────────┼───────────────┐
-         ▼               ▼               ▼
-    Agent Certs    Relay Cert    Connector Certs
-    (client-1)   (relay-server)  (connector-hq-datacenter)
+```mermaid
+graph TD
+    RootCA["<b>Root CA</b><br/>(zgate-ca)<br/>ca.crt / ca.key<br/>RSA 4096-bit, Validity: 10 years"]
+
+    RootCA --> AgentCert["<b>Agent Certificate</b><br/>CN=client-{N}<br/>client-{N}.crt / client-{N}.key<br/>RSA 2048-bit"]
+    RootCA --> RelayCert["<b>Relay Certificate</b><br/>CN=relay-server<br/>relay-server.crt / relay-server.key<br/>RSA 2048-bit"]
+    RootCA --> ConnCert["<b>Connector Certificate</b><br/>CN=connector-{site}<br/>connector.crt / connector.key<br/>RSA 2048-bit"]
 ```
 
-### 4.2 Certificate Roles
+### 4.2 Component Certificate Matrix
 
-#### Agent Certificate (Client)
+Certificate files, purposes, and TLS roles held by each system component:
+
+#### Agent (zgate-agent)
+
+| File | Description | Used In | TLS Role |
+|------|-------------|---------|----------|
+| `ca.crt` | Root CA certificate | Outer TLS, Inner TLS | Validates Relay/Connector certificates |
+| `client-{N}.crt` | Agent client certificate (CN=client-{N}) | Outer TLS (Agent → Relay) | mTLS Client Authentication |
+| `client-{N}.key` | Agent private key | Outer TLS (Agent → Relay) | mTLS Client Authentication |
+
+**TLS connection roles:**
+- **Outer TLS (Agent → Relay)**: TLS Client (presents client certificate via mTLS)
+- **Inner TLS (Agent → Connector)**: TLS Client (validates Connector server certificate)
+
+#### Relay (zgate-relay)
+
+| File | Description | Used In | TLS Role |
+|------|-------------|---------|----------|
+| `ca.crt` | Root CA certificate | Outer TLS (both directions) | Validates Agent/Connector certificates |
+| `relay-server.crt` | Relay server certificate (CN=relay-server) | Outer TLS (Relay ← Agent) | TLS Server Authentication |
+| `relay-server.key` | Relay private key | Outer TLS (Relay ← Agent) | TLS Server Authentication |
+
+**TLS connection roles:**
+- **Outer TLS (Agent → Relay)**: TLS Server (presents server certificate + validates Agent client certificate)
+- **Outer TLS (Relay → Connector)**: TLS Client (authenticates via Relay certificate with mTLS)
+- **Inner TLS**: **Not involved** (Agent ↔ Connector E2E traffic is relayed as opaque bytes only)
+
+> **Important**: The Relay does not hold any Inner TLS certificates or private keys. This makes it cryptographically impossible for the Relay to decrypt Inner TLS sessions.
+
+#### Connector (zgate-connector)
+
+| File | Description | Used In | TLS Role |
+|------|-------------|---------|----------|
+| `ca.crt` | Root CA certificate | Outer TLS, Inner TLS | Validates Relay/Agent certificates |
+| `connector.crt` | Connector server certificate (CN=connector-{site}) | Inner TLS (Connector ← Agent), Outer TLS (Connector ← Relay) | TLS Server Authentication |
+| `connector.key` | Connector private key | Inner TLS, Outer TLS | TLS Server Authentication |
+
+**TLS connection roles:**
+- **Outer TLS (Relay → Connector)**: TLS Server (accepts Reverse Tunnel, validates Relay certificate)
+- **Inner TLS (Agent → Connector)**: TLS Server (presents server certificate + validates Agent client certificate)
+
+#### Certificate Authority (CA)
+
+| File | Description | Location | Access |
+|------|-------------|----------|--------|
+| `ca.crt` | Root CA public certificate | Distributed to all components | Public |
+| `ca.key` | Root CA private key | Secure storage (HSM or offline) | **Restricted** |
+
+### 4.3 Certificate Validation Flow
+
+Which component validates whose certificate, in which connection:
+
+```mermaid
+graph LR
+    subgraph "Outer TLS: Agent → Relay"
+        A1["Agent"] -->|"Verify: relay-server.crt<br/>(CA signature, CN match, expiry)"| R1["Relay"]
+        R1 -->|"Verify: client-{N}.crt<br/>(CA signature, CN→ClientID extraction)"| A1
+    end
+
+    subgraph "Outer TLS: Relay → Connector"
+        R2["Relay"] -->|"Verify: connector.crt<br/>(CA signature, CN→ConnectorID extraction)"| C1["Connector"]
+        C1 -->|"Verify: relay-server.crt<br/>(CA signature)"| R2
+    end
+
+    subgraph "Inner TLS: Agent → Connector (E2E)"
+        A2["Agent"] -->|"Verify: connector.crt<br/>(CA signature, CN == policy connector_id)"| C2["Connector"]
+        C2 -->|"Verify: client-{N}.crt<br/>(CA signature, CN→ClientID, internal ACL)"| A2
+    end
+```
+
+### 4.4 Certificate Details
+
+#### Agent Certificate
 ```yaml
 Subject:
-  CN: client-1
+  CN: client-{N}     # e.g., client-1, client-medical-staff
   O: MASQUE-Prod
   OU: Client
-Usage:
-  - TLS Client Authentication (Outer TLS to Relay)
-  - Digital Signature
 Extended Key Usage:
   - clientAuth
-Validity: 90 days (auto-rotated via cert-manager)
+Validity: 90 days (cert-manager auto-rotation)
 ```
 
-#### Relay Certificate (Server + Client)
+#### Relay Certificate
 ```yaml
 Subject:
   CN: relay-server
   O: MASQUE-Prod
   OU: Relay
-Usage:
-  - TLS Server Authentication (for Agent connections)
-  - TLS Client Authentication (for Connector connections)
-  - Digital Signature
 Extended Key Usage:
   - serverAuth
-  - clientAuth
+  - clientAuth          # Also used for connections to Connector
 DNS SAN:
   - relay.zgate.svc.cluster.local
   - relay-server
-```
-
-#### Connector Certificate (Server)
-```yaml
-Subject:
-  CN: connector-hq-datacenter
-  O: MASQUE-Prod
-  OU: Connector
-Usage:
-  - TLS Server Authentication (Inner TLS from Agent)
-  - TLS Server Authentication (Outer TLS from Relay)
-  - Digital Signature
-Extended Key Usage:
-  - serverAuth
-DNS SAN:
-  - connector-hq-datacenter.internal
 Validity: 90 days
 ```
 
-### 4.3 Certificate Validation
-
-**Agent validates:**
-1. **Relay Certificate** (Outer TLS)
-   - Issued by trusted CA
-   - CN matches expected relay hostname
-   - Not expired
-
-2. **Connector Certificate** (Inner TLS)
-   - Issued by trusted CA
-   - **CN matches connector_id from ACL policy**
-   - Not expired
-   - Prevents MITM by malicious Relay
-
-**Relay validates:**
-1. **Agent Certificate** (Outer TLS)
-   - Issued by trusted CA
-   - Extracts ClientID from CN field
-
-2. **Connector Certificate** (Outer TLS - reverse tunnel)
-   - Issued by trusted CA
-   - Extracts ConnectorID from CN field
-
-**Connector validates:**
-1. **Agent Certificate** (Inner TLS)
-   - Issued by trusted CA
-   - Extracts ClientID for internal ACL
-   - Optional: Additional identity verification
+#### Connector Certificate
+```yaml
+Subject:
+  CN: connector-{site}  # e.g., connector-hq-datacenter
+  O: MASQUE-Prod
+  OU: Connector
+Extended Key Usage:
+  - serverAuth          # Server for both Inner TLS and Outer TLS
+  - clientAuth          # Optional: for Agent certificate verification
+DNS SAN:
+  - connector-{site}.internal
+Validity: 90 days
+```
 
 ---
 
@@ -315,436 +273,226 @@ Validity: 90 days
 
 ### 5.1 Connection Establishment
 
-```
-Agent                    Relay                 Connector            On-Prem DB
-  │                        │                        │                    │
-  │ 1. QUIC Handshake      │                        │                    │
-  ├───────────────────────>│                        │                    │
-  │ (Outer TLS 1.3 + mTLS) │                        │                    │
-  │<───────────────────────┤                        │                    │
-  │                        │                        │                    │
-  │ 2. MASQUE CONNECT      │                        │                    │
-  ├───────────────────────>│                        │                    │
-  │ Protocol: connect-ip   │                        │                    │
-  │ ConnectorID: hq-dc     │                        │                    │
-  │ Destination: db:5432   │                        │                    │
-  │                        │                        │                    │
-  │                        │ 3. Lookup Connector    │                    │
-  │                        │    (session manager)   │                    │
-  │                        │                        │                    │
-  │                        │ 4. Check ACL           │                    │
-  │                        │    allow connector:    │                    │
-  │                        │      hq-dc/db:5432     │                    │
-  │                        │                        │                    │
-  │                        │ 5. Establish Tunnel    │                    │
-  │                        ├───────────────────────>│                    │
-  │                        │ (Outer TLS)            │                    │
-  │                        │                        │                    │
-  │ 6. HTTP 200 OK         │                        │                    │
-  │<───────────────────────┤                        │                    │
-  │ (Address Assign)       │                        │                    │
-  │                        │                        │                    │
-  │ 7. Inner TLS Handshake │                        │                    │
-  ├────────────────────────┼───────────────────────>│                    │
-  │    ClientHello         │  [Encrypted Blob]      │                    │
-  │<───────────────────────┼────────────────────────┤                    │
-  │    ServerHello         │  [Encrypted Blob]      │                    │
-  │    Certificate         │                        │                    │
-  │    (connector-hq-dc)   │                        │                    │
-  │                        │                        │                    │
-  │ 8. Verify Connector    │                        │                    │
-  │    Certificate CN      │                        │                    │
-  │    ✅ Matches policy   │                        │                    │
-  │                        │                        │                    │
-  │ 9. Application Data    │                        │                    │
-  ├────────────────────────┼───────────────────────>│ 10. Decrypt        │
-  │ SQL Query (E2E encrypt)│  [Opaque to Relay]     ├───────────────────>│
-  │                        │                        │ SELECT * FROM ...  │
-  │                        │                        │                    │
-  │                        │                        │<───────────────────┤
-  │                        │                        │ Result Set         │
-  │<───────────────────────┼────────────────────────┤                    │
-  │ (E2E encrypted)        │  [Opaque to Relay]     │                    │
-  │                        │                        │                    │
+```mermaid
+sequenceDiagram
+    participant App as User App
+    participant A as Agent
+    participant R as Relay
+    participant C as Connector
+    participant DB as Internal DB
+
+    Note over A,R: Phase 1: Outer TLS Establishment (QUIC/HTTP3 + mTLS)
+    A->>R: QUIC Handshake<br/>(Agent cert: client-1.crt)
+    R->>R: Verify Agent cert (CA signature, extract CN=client-1)
+    R-->>A: Server Hello<br/>(Relay cert: relay-server.crt)
+    A->>A: Verify Relay cert (CA signature, CN match)
+
+    Note over A,R: Phase 2: MASQUE Tunnel Request
+    A->>R: HTTP CONNECT<br/>Protocol: connect-tcp<br/>Connector-ID: hq-datacenter<br/>Destination: postgres.internal:5432
+    R->>R: ACL Check<br/>(client-1 → hq-datacenter:postgres:5432)
+    R->>C: Forward tunnel request via Reverse Tunnel
+    R-->>A: HTTP 200 OK (Tunnel Established)
+
+    Note over A,C: Phase 3: Inner TLS Handshake (E2E, opaque to Relay)
+    A->>C: TLS ClientHello + KeyShare (X25519)<br/>[Relay sees: encrypted blob]
+    C-->>A: TLS ServerHello + KeyShare (X25519)<br/>+ Certificate (connector-hq-datacenter.crt)<br/>[Relay sees: encrypted blob]
+    A->>A: Verify Connector cert CN == "hq-datacenter"<br/>(Certificate Pinning)
+    A->>C: Finished<br/>[Relay sees: encrypted blob]
+
+    Note over A,C: Phase 4: Application Data (E2E Encrypted)
+    App->>A: SQL Query (plaintext)
+    A->>C: Inner TLS Encrypted SQL<br/>[Relay sees: opaque bytes only]
+    C->>DB: SELECT * FROM patients WHERE id=12345
+    DB-->>C: Result Set
+    C-->>A: Inner TLS Encrypted Response<br/>[Relay sees: opaque bytes only]
+    A-->>App: SQL Response (plaintext)
 ```
 
 ### 5.2 Data Plane (Steady State)
 
-**Upstream (Agent → Database):**
-```
-Agent:
-  1. App writes SQL query: "SELECT * FROM patients WHERE ..."
-  2. Encrypt with Inner TLS (Agent → Connector session)
-     → TLS_AES_256_GCM_SHA384 encrypted blob
-  3. Wrap in TCP packet
-  4. Wrap in Capsule Protocol (IP_PACKET type)
-  5. Encrypt with Outer TLS (Agent → Relay session)
-  6. Send via QUIC
+**Upstream (Agent → Internal DB):**
 
-Relay:
-  1. Decrypt Outer TLS → Get Capsule frames
-  2. Extract TCP packet (still encrypted with Inner TLS)
-  3. 🔴 Cannot decrypt Inner TLS payload
-  4. Forward encrypted TCP packet to Connector
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant A as Agent
+    participant R as Relay
+    participant C as Connector
+    participant DB as Internal DB
 
-Connector:
-  1. Receive encrypted TCP packet from Relay
-  2. Decrypt Inner TLS → Get plaintext SQL query
-  3. Forward to database (10.0.1.5:5432)
-```
+    App->>A: SQL Query (plaintext)
+    A->>A: 1. Inner TLS Encrypt<br/>(AES-256-GCM, Agent↔Connector session key)
+    A->>A: 2. Wrap in TCP packet
+    A->>A: 3. Encapsulate in Capsule (IP_PACKET 0x40)
+    A->>R: 4. Send via Outer TLS (QUIC/HTTP3)
 
-**Downstream (Database → Agent):**
-```
-Database → Connector → (Inner TLS encrypt) → Relay → (Forward opaque blob) → Agent → (Inner TLS decrypt)
+    Note over R: Relay Processing
+    R->>R: 5. Decrypt Outer TLS → Capsule frames
+    R->>R: 6. Extract TCP packet<br/>(Inner TLS payload is still encrypted)
+    R->>R: 7. ACL check on metadata (ConnectorID, Destination)
+    R->>C: 8. Forward encrypted TCP to Connector
+
+    C->>C: 9. Decrypt Inner TLS → plaintext SQL
+    C->>DB: 10. Forward: SELECT * FROM patients...
 ```
 
 ---
 
-## 6. Implementation Details
+## 6. Security Proofs
 
-### 6.1 Agent Implementation
+### 6.1 Relay Cannot Decrypt Inner TLS
 
-**File:** `agent/connector_client.go` (new)
+Inner TLS performs key exchange using **X25519 ECDHE (Ephemeral Diffie-Hellman)**:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant R as Relay (Observer)
+    participant C as Connector
+
+    A->>C: KeyShare: ephemeral pubkey_A (X25519)
+    Note over R: Relay sees pubkey_A (public value)
+    C-->>A: KeyShare: ephemeral pubkey_C (X25519)
+    Note over R: Relay sees pubkey_C (public value)
+
+    Note over A: Derive: K = HKDF(DH(privkey_A, pubkey_C))
+    Note over C: Derive: K = HKDF(DH(privkey_C, pubkey_A))
+    Note over R: Cannot compute K<br/>privkey_A and privkey_C are<br/>never transmitted over the network<br/>(ECDLP: computationally infeasible)
+
+    A->>C: Application Data encrypted with K
+    Note over R: Sees only ciphertext<br/>Cannot derive K
+```
+
+**Why the Relay cannot decrypt:**
+1. **Forward Secrecy**: Session keys are derived from Ephemeral DH, independent of certificate private keys
+2. **Private keys never shared**: `privkey_A` (Agent) and `privkey_C` (Connector) are never transmitted over the network
+3. **ECDLP hardness**: Computing private keys from public keys (`pubkey_A`, `pubkey_C`) is computationally infeasible
+4. **Relay holds no certificates**: The Relay does not possess any certificates or keys related to Inner TLS
+
+Even if the Relay later obtains the long-term certificates of Agent or Connector, **decrypting past sessions is impossible** (Forward Secrecy).
+
+### 6.2 Certificate Pinning Prevents MITM
+
+Prevents a malicious Relay from impersonating a Connector:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant R as Evil Relay
+    participant C as Real Connector
+
+    A->>R: Inner TLS ClientHello
+    R->>R: Generate fake certificate<br/>CN=evil-relay (or forged CN)
+    R-->>A: ServerHello + Fake Certificate
+
+    A->>A: Certificate Verification:<br/>1. CA signature check → FAIL<br/>(Relay has no CA private key)<br/>OR<br/>2. CN mismatch: expected "connector-hq-datacenter"<br/>got "evil-relay" → FAIL
+
+    Note over A: Connection REJECTED
+    A-xR: TLS Handshake Aborted
+```
+
+**Defense mechanisms:**
+- Agent verifies that the Connector certificate CN matches the `connector_id` in the ACL policy during Inner TLS
+- Certificates must be signed by the trusted CA
+- The Relay cannot forge a valid Connector certificate because it does not possess the CA private key
+
+### 6.3 Metadata Leakage Analysis
+
+| Metadata | Source | Risk | Mitigation |
+|----------|--------|------|-----------|
+| ClientID | mTLS cert | Low | Required for ACL |
+| ConnectorID | CONNECT header | Low | Required for routing |
+| Destination hostname | CONNECT header | Medium | Can be mitigated by using IP addresses |
+| Connection timing | Observation | Medium | No practical mitigation |
+| Traffic volume | TCP flow size | Medium | Padding (future) |
+| Application protocol | N/A | **Protected** | Inner TLS prevents DPI |
+
+---
+
+## 7. Implementation Overview
+
+### 7.1 Agent: Inner TLS Client
 
 ```go
-package main
-
-import (
-    "crypto/tls"
-    "crypto/x509"
-    "fmt"
-    "io"
-    "net"
-)
-
-// ConnectorDialer establishes E2E encrypted connection through Relay
+// agent/connector_client.go
 type ConnectorDialer struct {
-    relayConn  io.ReadWriter  // Outer TLS connection to Relay
+    relayConn   io.ReadWriter  // Outer TLS tunnel to Relay
     connectorID string
-    caCertPool *x509.CertPool
+    caCertPool  *x509.CertPool
 }
 
-// DialConnector establishes Inner TLS connection to Connector
-// This connection is encrypted E2E and opaque to Relay
-func (d *ConnectorDialer) DialConnector(destination string) (net.Conn, error) {
-    // 1. Wrap Relay connection in TLS client
+func (d *ConnectorDialer) DialConnector() (net.Conn, error) {
     innerTLSConfig := &tls.Config{
         RootCAs:    d.caCertPool,
-        ServerName: d.connectorID, // Must match Connector certificate CN
+        ServerName: d.connectorID, // Must match Connector cert CN
         MinVersion: tls.VersionTLS13,
-        CipherSuites: []uint16{
-            tls.TLS_AES_256_GCM_SHA384,
-            tls.TLS_CHACHA20_POLY1305_SHA256,
-        },
     }
-
-    // 2. Establish Inner TLS over Relay tunnel
     innerConn := tls.Client(d.relayConn, innerTLSConfig)
-
-    // 3. Perform Inner TLS handshake
     if err := innerConn.Handshake(); err != nil {
         return nil, fmt.Errorf("inner TLS handshake failed: %w", err)
     }
-
-    // 4. Verify Connector certificate
-    state := innerConn.ConnectionState()
-    if len(state.PeerCertificates) == 0 {
-        return nil, fmt.Errorf("no peer certificate")
-    }
-
-    peerCN := state.PeerCertificates[0].Subject.CommonName
+    // Verify Connector certificate CN
+    peerCN := innerConn.ConnectionState().PeerCertificates[0].Subject.CommonName
     if peerCN != d.connectorID {
-        return nil, fmt.Errorf("connector CN mismatch: got %s, expected %s",
-            peerCN, d.connectorID)
+        return nil, fmt.Errorf("connector CN mismatch: got %s, want %s", peerCN, d.connectorID)
     }
-
-    log.Printf("[Agent] E2E TLS established with Connector: %s", peerCN)
-    log.Printf("[Agent] Cipher: %s", tls.CipherSuiteName(state.CipherSuite))
-
     return innerConn, nil
 }
 ```
 
-**Usage in Agent:**
-```go
-// In startConnectorTunnel function
-func startConnectorTunnel(client *http.Client, connectorID, destination string) error {
-    // 1. Establish Outer TLS tunnel to Relay (existing MASQUE CONNECT)
-    req, _ := http.NewRequest(http.MethodConnect, RelayURL, pr)
-    req.Header.Set("Protocol", "connect-tcp")  // New: TCP tunneling for Connector
-    req.Header.Set("Connector-ID", connectorID)
-    req.Header.Set("Destination", destination)
-
-    resp, err := client.Do(req)
-    if resp.StatusCode != http.StatusOK {
-        return fmt.Errorf("relay rejected: %s", resp.Status)
-    }
-
-    // 2. Establish Inner TLS (E2E to Connector)
-    dialer := &ConnectorDialer{
-        relayConn:   resp.Body,  // This is the Outer TLS tunnel
-        connectorID: connectorID,
-        caCertPool:  loadCACertPool(),
-    }
-
-    innerConn, err := dialer.DialConnector(destination)
-    if err != nil {
-        return err
-    }
-
-    // 3. Now innerConn is E2E encrypted to Connector
-    // Application can use it directly for SQL/HTTP/etc
-    return proxyToApplication(innerConn)
-}
-```
-
-### 6.2 Relay Implementation
-
-**File:** `relay/connector_proxy.go` (new)
+### 7.2 Relay: Opaque Byte Proxy
 
 ```go
-package relay
-
-import (
-    "io"
-    "log/slog"
-    "net/http"
-)
-
-// handleConnectorRequest proxies E2E encrypted traffic between Agent and Connector
-// Relay CANNOT and MUST NOT decrypt the Inner TLS payload
+// relay/connector_proxy.go
 func handleConnectorRequest(w http.ResponseWriter, r *http.Request) {
     connectorID := r.Header.Get("Connector-ID")
-    destination := r.Header.Get("Destination")
     clientID := extractClientID(r)
 
-    // 1. Validate ACL (based on metadata only)
-    decision := aclEngine.CheckConnectorAccess(clientID, connectorID, destination)
-    if decision == acl.ActionDeny {
-        auditLogger.LogConnectorAccess(clientID, connectorID, destination, false)
+    // ACL check on metadata ONLY (cannot inspect payload)
+    if aclEngine.CheckConnectorAccess(clientID, connectorID, destination) == acl.ActionDeny {
         w.WriteHeader(http.StatusForbidden)
         return
     }
 
-    // 2. Lookup Connector session (reverse tunnel)
     connector := sessionManager.GetConnectorByID(connectorID)
-    if connector == nil {
-        sysLogger.Warn("Connector not found",
-            slog.String("connector_id", connectorID),
-        )
-        w.WriteHeader(http.StatusBadGateway)
-        return
-    }
-
-    auditLogger.LogConnectorAccess(clientID, connectorID, destination, true)
-
-    // 3. Establish bidirectional proxy
-    // Relay acts as a dumb TCP proxy - cannot see Inner TLS content
     w.WriteHeader(http.StatusOK)
 
-    // 4. Bidirectional copy (opaque byte streams)
+    // Bidirectional copy of OPAQUE byte streams
+    // Relay CANNOT decrypt Inner TLS payload
     go io.Copy(connector.Upstream, r.Body)    // Agent → Connector (encrypted)
     io.Copy(w, connector.Downstream)          // Connector → Agent (encrypted)
-
-    // Note: Relay sees only encrypted TLS records, not plaintext application data
 }
 ```
 
-**Key Principle:**
-- Relay performs `io.Copy` on encrypted byte streams
-- No access to TLS session keys
-- No decryption of Inner TLS payload
-- ACL enforcement based on metadata (connectorID, destination) only
-
-### 6.3 Connector Implementation
-
-**File:** `connector/server.go` (new binary)
+### 7.3 Connector: Inner TLS Server
 
 ```go
-package main
-
-import (
-    "crypto/tls"
-    "log"
-    "net"
-)
-
-func main() {
-    // 1. Establish reverse tunnel to Relay (Outer TLS)
-    tlsConfig := loadMTLSConfig()  // Connector certificate
-    relayConn, err := tls.Dial("tcp", "relay.example.com:4433", tlsConfig)
-    if err != nil {
-        log.Fatalf("Failed to connect to Relay: %v", err)
+// connector/server.go
+func acceptInnerTLS(relayConn net.Conn) {
+    innerTLSConfig := &tls.Config{
+        Certificates: []tls.Certificate{loadConnectorCert()},
+        ClientAuth:   tls.RequireAndVerifyClientCert,
+        ClientCAs:    loadCACertPool(),
+        MinVersion:   tls.VersionTLS13,
     }
-
-    log.Println("Reverse tunnel established to Relay")
-
-    // 2. Listen for Inner TLS connections from Agents
-    for {
-        // Relay forwards Agent's Inner TLS ClientHello
-        innerTLSConfig := &tls.Config{
-            Certificates: []tls.Certificate{loadConnectorCert()},
-            ClientAuth:   tls.RequireAndVerifyClientCert,  // Verify Agent cert
-            ClientCAs:    loadCACertPool(),
-            MinVersion:   tls.VersionTLS13,
-        }
-
-        // 3. Accept Inner TLS connection
-        innerConn := tls.Server(relayConn, innerTLSConfig)
-        if err := innerConn.Handshake(); err != nil {
-            log.Printf("Inner TLS handshake failed: %v", err)
-            continue
-        }
-
-        // 4. Extract Agent ClientID from certificate
-        state := innerConn.ConnectionState()
-        agentClientID := state.PeerCertificates[0].Subject.CommonName
-
-        log.Printf("E2E TLS established with Agent: %s", agentClientID)
-
-        // 5. Proxy to internal resource
-        go handleInternalProxy(innerConn, agentClientID)
-    }
-}
-
-func handleInternalProxy(innerConn net.Conn, clientID string) {
-    // Connector can now see plaintext application data
-    // Forward to internal database/service
-    internalConn, err := net.Dial("tcp", "postgres.internal:5432")
-    if err != nil {
-        log.Printf("Failed to connect to internal resource: %v", err)
+    innerConn := tls.Server(relayConn, innerTLSConfig)
+    if err := innerConn.Handshake(); err != nil {
         return
     }
-
-    // Bidirectional proxy
-    go io.Copy(internalConn, innerConn)
-    io.Copy(innerConn, internalConn)
+    agentClientID := innerConn.ConnectionState().PeerCertificates[0].Subject.CommonName
+    // Connector can now see plaintext application data
+    go proxyToInternal(innerConn, "postgres.internal:5432")
 }
 ```
 
 ---
 
-## 7. Security Proofs
+## 8. Operational Security
 
-### 7.1 Relay Cannot Decrypt Inner TLS
+### 8.1 Certificate Rotation
 
-**Cryptographic Guarantee:**
-
-Inner TLS session uses **ephemeral Diffie-Hellman key exchange (X25519 ECDHE)**:
-
-```
-Agent                             Connector
-  │                                   │
-  │  ClientHello                      │
-  │  + KeyShare (ephemeral pubkey_A)  │
-  ├──────────────────────────────────>│
-  │                                   │
-  │                   ServerHello     │
-  │   + KeyShare (ephemeral pubkey_C) │
-  │<──────────────────────────────────┤
-  │                                   │
-  ▼                                   ▼
-Derive session key:                Derive session key:
-  K = HKDF(DH(privkey_A, pubkey_C))   K = HKDF(DH(privkey_C, pubkey_A))
-```
-
-**Why Relay cannot decrypt:**
-1. **Forward Secrecy**: Session keys are ephemeral (not derived from certificates)
-2. **No access to private keys**: Relay never sees `privkey_A` or `privkey_C`
-3. **DH security**: Computing `K` without either private key is computationally infeasible (ECDLP hard problem)
-
-Even if Relay obtains Agent or Connector certificates later, it cannot decrypt past sessions.
-
-### 7.2 Certificate Pinning Prevents MITM
-
-**Attack Scenario:**
-Malicious Relay attempts to impersonate Connector:
-
-```
-Agent                  Evil Relay              Real Connector
-  │                        │                         │
-  │  Inner TLS ClientHello │                         │
-  ├───────────────────────>│                         │
-  │                        │ (Relay generates fake   │
-  │                        │  certificate)           │
-  │<───────────────────────┤                         │
-  │  ServerHello           │                         │
-  │  Cert: CN=evil-relay   │                         │
-  │                        │                         │
-  ▼                        ▼                         ▼
-Agent verifies certificate CN:
-  Expected: "connector-hq-datacenter"
-  Received: "evil-relay"
-  ❌ Verification FAILS
-```
-
-**Mitigation:**
-- Agent validates Connector certificate CN matches `connector_id` from policy
-- Certificate must be signed by trusted CA
-- Relay cannot generate valid certificate (no access to CA private key)
-
-### 7.3 Metadata Leakage Analysis
-
-**What Relay learns from metadata:**
-
-| Metadata | Source | Risk Level | Mitigation |
-|----------|--------|-----------|-----------|
-| ClientID | mTLS cert | Low | Required for ACL |
-| ConnectorID | CONNECT header | Low | Required for routing |
-| Destination hostname | CONNECT header | Medium | Use IP addresses if sensitive |
-| Connection timing | Observation | Medium | No practical mitigation |
-| Traffic volume | TCP flow size | Medium | Padding (future) |
-| Application protocol | None | ✅ Hidden | E2E TLS prevents DPI |
-
-**Critical: Application data is fully protected**
-- SQL queries: ✅ Encrypted
-- HTTP request bodies: ✅ Encrypted
-- Database responses: ✅ Encrypted
-- Authentication tokens: ✅ Encrypted
-
----
-
-## 8. Performance Considerations
-
-### 8.1 Encryption Overhead
-
-**Latency Impact:**
-```
-Without E2E:    Agent ──[1 TLS]──> Relay ──[Plaintext]──> Connector
-                RTT: ~50ms
-
-With E2E:       Agent ──[Outer TLS]──> Relay ──[Forward]──> Connector
-                         └──[Inner TLS (via Relay)]──────────┘
-                RTT: ~70ms (+20ms for Inner TLS handshake)
-```
-
-**Throughput Impact:**
-- AES-GCM hardware acceleration: ~10 GB/s on modern CPUs
-- Negligible overhead for typical medical workloads (<100 Mbps)
-
-### 8.2 TLS Handshake Optimization
-
-**TLS 1.3 0-RTT Resumption:**
-```go
-// Agent side
-innerTLSConfig := &tls.Config{
-    ClientSessionCache: tls.NewLRUClientSessionCache(128),  // Enable session resumption
-}
-```
-
-**Benefit:**
-- First connection: 1-RTT handshake
-- Subsequent connections: 0-RTT (resume with PSK)
-- Reduces latency from 70ms → 50ms
-
----
-
-## 9. Operational Security
-
-### 9.1 Certificate Rotation
-
-**Automated Rotation (cert-manager):**
 ```yaml
+# cert-manager Certificate resource example
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -752,325 +500,210 @@ metadata:
 spec:
   secretName: connector-hq-datacenter-tls
   duration: 2160h       # 90 days
-  renewBefore: 720h     # Renew 30 days before expiry
-  subject:
-    organizations:
-      - MASQUE-Prod
+  renewBefore: 720h     # 30 days before expiry
   commonName: connector-hq-datacenter
-  usages:
-    - server auth
-    - client auth
+  usages: [server auth, client auth]
   issuerRef:
     name: zgate-ca-issuer
 ```
 
-**Rotation Process:**
-1. cert-manager renews certificate 30 days before expiry
-2. Connector reloads certificate (via fsnotify watcher)
-3. Existing connections continue with old certificate
-4. New connections use new certificate
-5. Zero downtime
+Rotation process:
+1. cert-manager renews certificates 30 days before expiry
+2. Connector detects certificate file changes via fsnotify and reloads
+3. Existing connections continue with the old certificate; new connections use the new one
+4. Zero downtime
 
-### 9.2 Audit Logging
+### 8.2 Audit Logging
 
-**Relay Audit Log (Metadata Only):**
+**Relay Audit Log (metadata only):**
 ```json
 {
   "timestamp": "2026-01-11T10:30:45Z",
-  "component": "ConnectorAudit",
-  "event": "connection_established",
+  "event": "connector_access",
   "client_id": "client-medical-staff",
   "connector_id": "connector-hq-datacenter",
   "destination": "postgres.internal:5432",
-  "action": "ALLOW",
-  "rule_id": "allow-internal-db",
-  "connection_duration_ms": 125000
+  "action": "ALLOW"
 }
 ```
 
-**What is NOT logged:**
-- ❌ SQL query content
-- ❌ HTTP request bodies
-- ❌ Database response data
-- ❌ Any decrypted Inner TLS payload
+**Not logged:** SQL query content, HTTP request body, DB responses, authentication tokens
 
-**Connector Audit Log (Full Visibility):**
+**Connector Audit Log (full visibility):**
 ```json
 {
   "timestamp": "2026-01-11T10:30:46Z",
-  "component": "ConnectorAudit",
   "event": "sql_query",
   "client_id": "client-medical-staff",
-  "database": "emr_prod",
   "query_type": "SELECT",
-  "affected_tables": ["patients"],
-  "duration_ms": 45
+  "affected_tables": ["patients"]
 }
 ```
 
-### 9.3 Incident Response
+### 8.3 Incident Response: Relay Compromise
 
-**Scenario: Relay Compromise**
+| Category | Impact | Note |
+|----------|--------|------|
+| **Protected** | Application data, DB credentials, Past sessions | Inner TLS + Forward Secrecy |
+| **Exposed** | Metadata (who connected where), Connection timing | Inherent in relay architecture |
 
-✅ **Protected:**
-- Application data (encrypted with Inner TLS)
-- Database credentials (never sent to Relay)
-- Historical session data (forward secrecy)
-
-⚠️ **Exposed:**
-- Metadata (which clients connected to which connectors)
-- Connection timing and volume
-- Active session state
-
-**Mitigation:**
-1. Rotate Relay certificates (revoke compromised cert)
-2. Audit metadata logs for suspicious patterns
-3. Application data remains protected (E2E encryption)
+Response procedure:
+1. Revoke Relay certificate (CRL/OCSP)
+2. Audit metadata logs
+3. Application data is protected by E2E encryption
 
 ---
 
-## 10. Compliance & Standards
+## 9. Performance Considerations
 
-### 10.1 Japan: Telecommunications Business Act Compliance
+| Metric | Without E2E | With E2E | Overhead |
+|--------|------------|----------|---------|
+| RTT | ~50ms | ~70ms | +20ms (Inner TLS handshake) |
+| Throughput | N/A | ~10 GB/s (AES-GCM HW accel) | Negligible |
+| Reconnection | N/A | ~50ms (TLS 1.3 0-RTT resumption) | Minimal |
 
-**Legal Compliance (電気通信事業法):**
-
-| Legal Requirement | Implementation | Status | Legal Reference |
-|------------------|----------------|--------|-----------------|
-| **Secrecy of Communications** | E2E TLS (Relay cannot decrypt) | ✅ | Art. 4, Art. 179 |
-| **Technical Measures** | Nested TLS architecture | ✅ | Art. 164 Sec. 2 |
-| **Metadata Logging Only** | Audit logs exclude payload | ✅ | MIC Guidelines |
-| **Sensitive Personal Info Protection** | Medical data encrypted E2E | ✅ | 個人情報保護法 Art. 2 |
-
-**Key Compliance Points:**
-
-1. **Relay as "Telecommunications Carrier" (電気通信事業者):**
-   - zgate Relay transmits communications between parties
-   - **Cannot inspect or use communication content** (Art. 4 violation)
-   - E2E encryption ensures technical impossibility of inspection
-
-2. **Audit Logging Compliance:**
-   - ✅ **Allowed**: Metadata (ClientID, ConnectorID, destination, timestamps)
-   - ❌ **Prohibited**: Communication content (SQL queries, HTTP bodies, database responses)
-   - Relay audit logs contain **metadata only** (Section 9.2)
-
-3. **Medical Data Handling:**
-   - Medical records are **"要配慮個人情報" (Sensitive Personal Information)**
-   - E2E encryption prevents Relay from accessing medical content
-   - Reduces legal liability for zgate operators
-
-**Criminal Liability Prevention:**
-```
-Without E2E:                    With E2E:
-  Relay decrypts traffic          Relay sees only encrypted blobs
-  ↓                               ↓
-  Operator can see medical data   Operator CANNOT see medical data
-  ↓                               ↓
-  Violates Art. 4                 Complies with Art. 4
-  ↓                               ↓
-  Criminal penalty possible       ✅ No legal violation
-  (2 years imprisonment)
-```
-
-### 10.2 HIPAA Compliance (USA)
-
-**Technical Safeguards (45 CFR § 164.312):**
-
-| Requirement | Implementation | Status |
-|------------|----------------|--------|
-| Access Control | mTLS + ACL | ✅ |
-| Transmission Security | TLS 1.3 E2E | ✅ |
-| Encryption | AES-256-GCM | ✅ |
-| Audit Controls | Structured logging | ✅ |
-
-**Key Compliance Point:**
-> "E2E encryption ensures that the Relay (a business associate) cannot access Protected Health Information (PHI), reducing HIPAA compliance scope."
-
-### 10.3 Zero Trust Architecture
-
-**NIST SP 800-207 Principles:**
-
-1. ✅ **Never trust, always verify**: mTLS at all layers
-2. ✅ **Least privilege access**: ACL per client/connector
-3. ✅ **Assume breach**: E2E encryption protects data even if Relay compromised
-4. ✅ **Inspect and log all traffic**: Metadata logging (not payload)
-5. ✅ **Microsegmentation**: Per-connector access control
-
----
-
-## 11. Testing & Validation
-
-### 11.1 Security Test Cases
-
-**Test 1: Verify Relay Cannot Decrypt**
-```bash
-# Setup: Run Relay with debug logging enabled
-export DEBUG_LOG_ENCRYPTED_PAYLOAD=true
-
-# Agent sends SQL query
-echo "SELECT * FROM patients WHERE ssn='123-45-6789'" | psql -h connector-db
-
-# Verify Relay logs show encrypted blob only
-grep "Inner TLS payload" /var/log/zgate/relay.log
-# Expected: [encrypted blob: 0x8f3a2b...]
-# NOT expected: "SELECT * FROM patients"
-```
-
-**Test 2: Certificate Pinning**
-```bash
-# Setup: Modify Agent to expect wrong Connector CN
-sed -i 's/connector-hq-datacenter/wrong-connector/g' agent.yaml
-
-# Attempt connection
-./zgate-agent --config agent.yaml
-
-# Expected: Connection refused with error
-# "connector CN mismatch: got connector-hq-datacenter, expected wrong-connector"
-```
-
-**Test 3: Forward Secrecy**
-```bash
-# 1. Establish connection and send data
-./zgate-agent --destination postgres.internal:5432
-
-# 2. Capture encrypted traffic
-tcpdump -i any -w /tmp/capture.pcap port 4433
-
-# 3. Obtain Agent and Connector private keys
-
-# 4. Attempt to decrypt captured traffic
-wireshark /tmp/capture.pcap
-# Right-click → Protocol Preferences → TLS → RSA Keys List
-# Add agent.key and connector.key
-
-# Expected: Inner TLS payload remains encrypted (forward secrecy prevents decryption)
-```
-
-### 11.2 Performance Benchmarks
-
-**Baseline (No E2E):**
-```bash
-# Direct connection to database
-pgbench -h postgres.internal -p 5432 -U admin -c 10 -j 4 -T 60 testdb
-# TPS: 1250 (excluding connections)
-# Latency: 8.0 ms average
-```
-
-**With E2E Encryption:**
-```bash
-# Connection through zgate with E2E TLS
-pgbench -h connector-proxy -p 5432 -U admin -c 10 -j 4 -T 60 testdb
-# TPS: 1180 (excluding connections)
-# Latency: 8.5 ms average
-# Overhead: ~5-6% (acceptable)
-```
-
----
-
-## 12. Future Enhancements
-
-### 12.1 Application-Level Encryption (Optional)
-
-For ultra-sensitive data, add application-layer encryption:
-
-```
-┌─ App Encryption (AES-256) ─┐
-│  ┌─ Inner TLS ─┐           │
-│  │ ┌─ Outer TLS ─┐         │
-│  │ │  Data       │         │
-│  │ └─────────────┘         │
-│  └─────────────────────────┘
-└────────────────────────────┘
-```
-
-**Use Case:** Encrypt specific fields (e.g., SSN) even at Connector
-
-### 12.2 Post-Quantum Cryptography
-
-Prepare for quantum threats:
+TLS 1.3 Session Resumption (0-RTT) minimizes reconnection latency:
 
 ```go
 innerTLSConfig := &tls.Config{
-    CurvePreferences: []tls.CurveID{
-        tls.X25519Kyber768Draft00,  // Hybrid ECDH + Kyber (PQC)
-        tls.X25519,
-    },
-}
-```
-
-**Timeline:** NIST PQC standards finalized (2024), TLS 1.3 extensions in development
-
-### 12.3 Traffic Padding (Anti-Traffic Analysis)
-
-Mitigate traffic analysis attacks:
-
-```go
-// Pad encrypted payload to fixed size blocks
-func padPayload(data []byte, blockSize int) []byte {
-    padLen := blockSize - (len(data) % blockSize)
-    return append(data, make([]byte, padLen)...)
+    ClientSessionCache: tls.NewLRUClientSessionCache(128),
 }
 ```
 
 ---
 
-## 13. Conclusion
+## 10. Testing & Validation
 
-The nested TLS architecture provides **strong cryptographic guarantees** that the Relay cannot decrypt or inspect traffic between Agents and on-premises resources.
+### 10.1 Relay Decryption Impossibility Test
 
-**Security Properties:**
-- ✅ **Confidentiality**: Inner TLS 1.3 with forward secrecy
-- ✅ **Integrity**: AEAD cipher (AES-GCM)
-- ✅ **Authentication**: mTLS at all layers with certificate pinning
-- ✅ **Non-repudiation**: Audit logs with cryptographic client identity
+```bash
+# Enable Relay debug logging and verify Inner TLS payload is not logged in plaintext
+export DEBUG_LOG_ENCRYPTED_PAYLOAD=true
 
-**Compliance:**
-- ✅ HIPAA-compliant transmission security
-- ✅ Zero Trust Architecture principles
-- ✅ Suitable for regulated industries (healthcare, finance)
+# Send SQL query from Agent
+echo "SELECT * FROM patients WHERE ssn='123-45-6789'" | psql -h connector-db
 
-**Implementation Status:** 📋 Planned for Phase 5.1
+# Verify Relay logs do not contain plaintext SQL
+grep "SELECT" /var/log/zgate/relay.log
+# Expected: No match (Relay cannot see plaintext)
+```
+
+### 10.2 Certificate Pinning Test
+
+```bash
+# Configure Agent with incorrect Connector CN
+# Expected: "connector CN mismatch" error, connection rejected
+./zgate-agent --connector-id wrong-connector
+```
+
+### 10.3 Forward Secrecy Test
+
+```bash
+# 1. Capture encrypted traffic
+tcpdump -i any -w /tmp/capture.pcap port 4433
+
+# 2. Attempt decryption using Agent/Connector long-term certificate private keys
+# Expected: Inner TLS payload cannot be decrypted (Forward Secrecy)
+```
 
 ---
 
-## Appendix A: Glossary
+## 11. Future Enhancements
+
+- **Post-Quantum Cryptography**: Use X25519Kyber768Draft00 (Hybrid ECDH + Kyber) for Inner TLS
+- **Traffic Padding**: Fixed-size block padding as a countermeasure against traffic analysis attacks
+- **Application-Level Encryption**: Encryption of ultra-sensitive fields (e.g., SSN) that even the Connector cannot decrypt
+
+---
+
+## Appendix A: Legal Background Details
+
+### A.1 Constitution of Japan, Article 21(2)
+> "No censorship shall be maintained, nor shall the secrecy of any means of communication be violated."
+
+Prohibits **all entities**, including telecommunications carriers, from censoring, disclosing, or using communication content.
+
+### A.2 Telecommunications Business Act
+
+**Article 4 (Protection of Secrecy of Communications):**
+> "The secrecy of communications handled by a telecommunications carrier shall not be violated."
+
+**Article 179 (Penalties):**
+- Violation of communication secrecy: **imprisonment up to 2 years or fine up to 1 million yen**
+
+**Article 164(2) (Technical Compliance Requirements):**
+> Telecommunications carriers must implement **technical measures** to prevent unauthorized access to communications.
+
+### A.3 Ministry of Internal Affairs and Communications (MIC) Guidelines
+
+> "When a telecommunications carrier operates a relay server that is **technically capable of accessing communication content**, E2E encryption must be implemented so that the relay server **cannot decrypt** the content."
+
+### A.4 Act on the Protection of Personal Information
+
+Medical records are classified as **"Special Care-Required Personal Information"** (Article 2(3)), requiring strict handling.
+Unauthorized disclosure: **imprisonment up to 1 year or fine up to 500,000 yen** (Article 177)
+
+### A.5 International Comparison
+
+| Jurisdiction | Framework | Criminal Penalty | E2E Required? |
+|-------------|-----------|-----------------|---------------|
+| **Japan** | Constitution Art.21 + Telecom Business Act Art.4 | 2 years imprisonment | **Yes** (MIC interpretation) |
+| **USA** | ECPA + Wiretap Act | 5 years imprisonment | Depends (HIPAA for medical) |
+| **EU** | GDPR + ePrivacy Directive | 4% of revenue | Recommended |
+
+---
+
+## Appendix B: Compliance Summary
+
+### HIPAA (USA)
+
+| Requirement | Implementation | Status |
+|------------|----------------|--------|
+| Access Control | mTLS + ACL | Compliant |
+| Transmission Security | TLS 1.3 E2E | Compliant |
+| Encryption | AES-256-GCM | Compliant |
+| Audit Controls | Structured logging | Compliant |
+
+### NIST SP 800-207 (Zero Trust)
+
+1. **Never trust, always verify**: mTLS at all layers
+2. **Least privilege**: Per-client/connector ACL
+3. **Assume breach**: E2E encryption protects data even if Relay is compromised
+4. **Microsegmentation**: Per-connector access control
+
+---
+
+## Appendix C: Glossary
 
 | Term | Definition |
 |------|------------|
-| **E2E Encryption** | End-to-end encryption where only endpoints can decrypt data |
-| **Inner TLS** | TLS session between Agent and Connector (E2E encrypted) |
-| **Outer TLS** | TLS session between Agent/Relay or Relay/Connector (transport) |
-| **Forward Secrecy** | Property where past sessions cannot be decrypted even if long-term keys compromised |
-| **Certificate Pinning** | Validating peer certificate CN matches expected identity |
+| **E2E Encryption** | Encryption where only the endpoints can decrypt |
+| **Inner TLS** | TLS session between Agent ↔ Connector (E2E) |
+| **Outer TLS** | TLS session between Agent ↔ Relay / Relay ↔ Connector (Transport) |
+| **Forward Secrecy** | Property ensuring past sessions cannot be decrypted even if long-term keys are compromised |
+| **Certificate Pinning** | Verification that a peer certificate CN matches the expected policy ID |
 | **AEAD** | Authenticated Encryption with Associated Data (e.g., AES-GCM) |
 | **mTLS** | Mutual TLS (both client and server present certificates) |
 
-## Appendix B: References
+---
+
+## Appendix D: References
 
 ### Technical Standards
-- **RFC 8446**: The Transport Layer Security (TLS) Protocol Version 1.3
+- **RFC 8446**: TLS 1.3
 - **RFC 9484**: Proxying IP in HTTP (MASQUE CONNECT-IP)
 - **RFC 9297**: HTTP Datagrams and the Capsule Protocol
 - **NIST SP 800-207**: Zero Trust Architecture
-- **NIST FIPS 140-2**: Security Requirements for Cryptographic Modules
 
-### Legal and Regulatory
-- **HIPAA Security Rule**: 45 CFR Part 160 and Part 164, Subparts A and C (USA)
-- **Constitution of Japan**: Article 21, Section 2 (Secrecy of Communications)
-- **Telecommunications Business Act (電気通信事業法)**:
-  - Article 4: Protection of Communications Secrecy
-  - Article 164, Section 2: Technical Compliance Requirements
-  - Article 179: Penal Provisions
-- **Act on the Protection of Personal Information (個人情報保護法)**:
-  - Article 2, Section 3: Sensitive Personal Information
-  - Article 177: Penal Provisions
-- **Ministry of Internal Affairs and Communications (MIC) Guidelines**:
-  - "Guidelines on the Protection of Communications Secrecy in Telecommunications Business" (通信の秘密の保護に関するガイドライン)
+### Legal
+- **Constitution of Japan**: Article 21(2)
+- **Telecommunications Business Act**: Articles 4, 164(2), 179
+- **Act on the Protection of Personal Information**: Articles 2(3), 177
+- **MIC Guidelines**: Guidelines on Protection of Secrecy of Communications
+- **HIPAA Security Rule**: 45 CFR § 164.312
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2026-01-11
+**Document Version:** 2.1
+**Last Updated:** 2026-02-11
 **Status:** Planning (Phase 5.1)
-**Authors:** zgate Security Team
-**Next Review:** Before Phase 5.1 implementation
