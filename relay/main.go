@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/guni1192/zgate/pkg/capsule"
@@ -40,6 +42,7 @@ const (
 	VirtualIPRange = "10.100.0.0/24"
 	ServerIP       = "10.100.0.1"
 	ServerMTU      = 1300
+	DrainTimeout   = 30 * time.Second
 )
 
 var (
@@ -57,8 +60,24 @@ func main() {
 	// Initialize health checker (before other components)
 	healthChecker = api.NewHealthChecker("phase-3.3")
 
+	// Setup signal handling for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
 	// Start health check server (HTTP/1.1 on port 8080)
-	go startHealthServer()
+	healthServer := newHealthServer()
+	go func() {
+		sysLogger.Info("Starting health check server",
+			slog.String("component", "API"),
+			slog.String("address", ":8080"),
+		)
+		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			sysLogger.Error("Health server failed",
+				slog.String("component", "API"),
+				slog.String("error", err.Error()),
+			)
+		}
+	}()
 
 	// Get OS-specific configuration (internal/net_*.go)
 	config := internal.GetWaterConfig()
@@ -204,7 +223,57 @@ func main() {
 		slog.String("keep_alive", "10s"),
 		slog.String("max_idle_timeout", "300s"),
 	)
-	log.Fatal(server.ListenAndServe())
+
+	// Start QUIC server in a goroutine
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	// Wait for shutdown signal or server error
+	select {
+	case <-ctx.Done():
+		sysLogger.Info("Shutdown signal received, starting graceful shutdown",
+			slog.String("component", "System"),
+			slog.String("drain_timeout", DrainTimeout.String()),
+		)
+	case err := <-serverErr:
+		sysLogger.Error("Server exited unexpectedly",
+			slog.String("component", "Server"),
+			slog.String("error", err.Error()),
+		)
+		log.Fatalf("Server exited: %v", err)
+	}
+
+	// Phase 1: Mark as not ready (k8s stops sending new traffic)
+	healthChecker.SetReady(false)
+	sysLogger.Info("Marked as not ready, draining connections",
+		slog.String("component", "System"),
+	)
+
+	// Phase 2: Drain existing connections with timeout
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), DrainTimeout)
+	defer drainCancel()
+
+	// Shutdown health server
+	if err := healthServer.Shutdown(drainCtx); err != nil {
+		sysLogger.Error("Health server shutdown error",
+			slog.String("component", "API"),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	// Close QUIC server (stops accepting new connections, waits for existing)
+	if err := server.Close(); err != nil {
+		sysLogger.Error("QUIC server close error",
+			slog.String("component", "Server"),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	sysLogger.Info("Graceful shutdown complete",
+		slog.String("component", "System"),
+	)
 }
 
 // handleMasqueRequest: Process per-client connection
@@ -577,26 +646,14 @@ func generateTLSConfig() *tls.Config {
 	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"h3"}}
 }
 
-// startHealthServer starts the HTTP/1.1 health check server on port 8080
-func startHealthServer() {
+// newHealthServer creates the HTTP/1.1 health check server on port 8080
+func newHealthServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthChecker.LivenessHandler)
 	mux.HandleFunc("/ready", healthChecker.ReadinessHandler)
 
-	server := &http.Server{
+	return &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
-	}
-
-	sysLogger.Info("Starting health check server",
-		slog.String("component", "API"),
-		slog.String("address", ":8080"),
-	)
-
-	if err := server.ListenAndServe(); err != nil {
-		sysLogger.Error("Health server failed",
-			slog.String("component", "API"),
-			slog.String("error", err.Error()),
-		)
 	}
 }
