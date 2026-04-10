@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zgate-relay
+  labels:
+    app.kubernetes.io/name: zgate-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: zgate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zgate-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zgate-relay
+        app.kubernetes.io/component: relay
+        app.kubernetes.io/part-of: zgate
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: relay
+          image: ghcr.io/guni1192/zgate-relay:latest
+          ports:
+            - name: masque
+              containerPort: 4433
+              protocol: UDP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: USE_MTLS
+              value: "true"
+            - name: ACL_POLICY_PATH
+              value: /etc/zgate/policy.yaml
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+            - name: policy
+              mountPath: /etc/zgate
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: zgate-relay-tls
+        - name: policy
+          configMap:
+            name: zgate-relay-policy
