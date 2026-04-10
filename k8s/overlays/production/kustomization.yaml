@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: zgate
+
+resources:
+  - ../../base/relay
+
+images:
+  - name: ghcr.io/guni1192/zgate-relay
+    newTag: v0.1.0
+
+replicas:
+  - name: zgate-relay
+    count: 3
+
+patches:
+  # GKE Autopilot: production resource limits
+  - target:
+      kind: Deployment
+      name: zgate-relay
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: zgate-relay
+      spec:
+        template:
+          spec:
+            containers:
+              - name: relay
+                resources:
+                  requests:
+                    cpu: 250m
+                    memory: 128Mi
+                    ephemeral-storage: 100Mi
+                  limits:
+                    cpu: "1"
+                    memory: 512Mi
+                    ephemeral-storage: 256Mi

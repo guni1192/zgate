@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zgate-relay-env
+  labels:
+    app.kubernetes.io/name: zgate-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: zgate
+data:
+  USE_MTLS: "true"
+  ACL_POLICY_PATH: /etc/zgate/policy.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zgate-relay-policy
+  labels:
+    app.kubernetes.io/name: zgate-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: zgate
+data:
+  policy.yaml: |
+    version: "1.0"
+    metadata:
+      name: "zgate-policy"
+      description: "IP-based ACL for ZTNA"
+
+    default_action: deny
+
+    clients: {}

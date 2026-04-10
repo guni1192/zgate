@@ -19,9 +19,15 @@ spec:
         app.kubernetes.io/part-of: zgate
     spec:
       terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: sysctl
+          image: busybox:1.37
+          command: ["sh", "-c", "sysctl -w net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
       containers:
         - name: relay
-          image: ghcr.io/guni1192/zgate-relay:latest
+          image: ghcr.io/guni1192/zgate-relay
           ports:
             - name: masque
               containerPort: 4433
@@ -29,11 +35,9 @@ spec:
             - name: health
               containerPort: 8080
               protocol: TCP
-          env:
-            - name: USE_MTLS
-              value: "true"
-            - name: ACL_POLICY_PATH
-              value: /etc/zgate/policy.yaml
+          envFrom:
+            - configMapRef:
+                name: zgate-relay-env
           volumeMounts:
             - name: tls-certs
               mountPath: /certs
@@ -55,13 +59,6 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 5
             failureThreshold: 3
-          resources:
-            requests:
-              cpu: 100m
-              memory: 64Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
           securityContext:
             capabilities:
               add:
