@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: zgate
+
+resources:
+  - ../../base/relay
+
+images:
+  - name: ghcr.io/guni1192/zgate-relay
+    newTag: v0.1.0
+
+replicas:
+  - name: zgate-relay
+    count: 3

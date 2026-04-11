@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zgate-relay-env
+  labels:
+    app.kubernetes.io/name: zgate-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: zgate
+data:
+  USE_MTLS: "true"
+  ACL_POLICY_PATH: /etc/zgate/policy.yaml
