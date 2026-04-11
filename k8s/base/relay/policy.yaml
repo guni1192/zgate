@@ -1,0 +1,8 @@
+version: "1.0"
+metadata:
+  name: "zgate-policy"
+  description: "IP-based ACL for ZTNA"
+
+default_action: deny
+
+clients: {}

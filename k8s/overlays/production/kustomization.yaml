@@ -13,28 +13,3 @@ images:
 replicas:
   - name: zgate-relay
     count: 3
-
-patches:
-  # GKE Autopilot: production resource limits
-  - target:
-      kind: Deployment
-      name: zgate-relay
-    patch: |
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: zgate-relay
-      spec:
-        template:
-          spec:
-            containers:
-              - name: relay
-                resources:
-                  requests:
-                    cpu: 250m
-                    memory: 128Mi
-                    ephemeral-storage: 100Mi
-                  limits:
-                    cpu: "1"
-                    memory: 512Mi
-                    ephemeral-storage: 256Mi

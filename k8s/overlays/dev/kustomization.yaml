@@ -10,47 +10,13 @@ images:
   - name: ghcr.io/guni1192/zgate-relay
     newTag: latest
 
-patches:
-  - target:
-      kind: ConfigMap
-      name: zgate-relay-policy
-    patch: |
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: zgate-relay-policy
-      data:
-        policy.yaml: |
-          version: "1.0"
-          metadata:
-            name: "zgate-policy-dev"
-            description: "Development ACL policy"
-
-          default_action: deny
-
-          clients:
-            client-1:
-              description: "Dev Client - Restricted"
-              rules:
-                - id: "allow-dns"
-                  type: ip_cidr
-                  action: allow
-                  destinations:
-                    - 8.8.8.8/32
-                    - 1.1.1.1/32
-                  metadata:
-                    reason: "DNS resolution"
-                - id: "deny-default"
-                  type: default
-                  action: deny
-
-            client-2:
-              description: "Dev Client - Full Access"
-              rules:
-                - id: "allow-all"
-                  type: ip_cidr
-                  action: allow
-                  destinations:
-                    - 0.0.0.0/0
-                  metadata:
-                    reason: "Full internet access"
+configMapGenerator:
+  - name: zgate-relay-policy
+    behavior: replace
+    files:
+      - policy.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: zgate-relay
+        app.kubernetes.io/component: relay
+        app.kubernetes.io/part-of: zgate

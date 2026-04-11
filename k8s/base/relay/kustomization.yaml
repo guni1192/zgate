@@ -5,3 +5,13 @@ resources:
   - deployment.yaml
   - service.yaml
   - configmap.yaml
+
+configMapGenerator:
+  - name: zgate-relay-policy
+    files:
+      - policy.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: zgate-relay
+        app.kubernetes.io/component: relay
+        app.kubernetes.io/part-of: zgate
